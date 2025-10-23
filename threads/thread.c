@@ -254,10 +254,11 @@ thread_unblock (struct thread *t)
     old_level = intr_disable ();
     ASSERT (t->status == THREAD_BLOCKED);
     
-   t->age = 0;
-    list_insert_ordered(&ready_list, &t->elem, thread_cmp_priority, NULL);
-    //list_push_back (&ready_list, &t->elem);
-    t->status = THREAD_READY;
+   t->status = THREAD_READY;
+   t->age[0] = t->age[1] = t->age[2] = 0;
+   t->queue_level = 0;
+
+   list_push_back(&mlfq[0], &t->elem);
     
    if(thread_current() != idle_thread && t->priority > thread_current()->priority)
        thread_yield();
