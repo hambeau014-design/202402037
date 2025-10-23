@@ -513,10 +513,16 @@ alloc_frame (struct thread *t, size_t size)
 static struct thread *
 next_thread_to_run (void)
 {
-    if (list_empty (&ready_list))
+    /*if (list_empty (&ready_list))
         return idle_thread;
     else
-        return list_entry (list_pop_front (&ready_list), struct thread, elem);
+        return list_entry (list_pop_front (&ready_list), struct thread, elem);*/
+   for(int i =0;i<3;i++)
+      {
+         if(!list_empty(&mlfq[i]))
+            return list_entry(list_pop_front(&mlfq[i], struct thread, elem);
+      }
+   return idle_thread;
 }
 
 /* Completes a thread switch by activating the new thread's page
