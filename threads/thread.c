@@ -645,6 +645,7 @@ aging_ready_threads(void)
             thread_yield();
       }
 }
+/*열심히 구현했건만....*/
 
 void
 mlfq_update(void)
