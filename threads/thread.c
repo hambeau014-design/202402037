@@ -54,6 +54,8 @@ static long long user_ticks;   /* # of timer ticks in user programs. */
 #define TIME_SLICE 4          /* # of timer ticks to give each thread. */
 static unsigned thread_ticks; /* # of timer ticks since last yield. */
 
+/* MLFQ - Q0, Q1, Q2. */
+static list mlfq[3];
 /* If false (default), use round-robin scheduler.
    If true, use multi-level feedback queue scheduler.
    Controlled by kernel command-line option "-o mlfqs". */
