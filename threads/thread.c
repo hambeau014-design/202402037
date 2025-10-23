@@ -183,6 +183,8 @@ thread_create (const char *name, int priority,
     /* Initialize thread. */
     init_thread (t, name, priority);
     tid = t->tid = allocate_tid ();
+   
+    t->age = 0;
 
     /* Prepare thread for first run by initializing its stack.
      Do this atomically so intermediate values for the 'stack' 
@@ -245,9 +247,13 @@ thread_unblock (struct thread *t)
 
     old_level = intr_disable ();
     ASSERT (t->status == THREAD_BLOCKED);
-    list_push_back (&ready_list, &t->elem);
+    
+   t->age = 0;
+    list_insert_ordered(&ready_list, &t->elem, thread_cmp_priority, NULL);
+    //list_push_back (&ready_list, &t->elem);
     t->status = THREAD_READY;
-    if(thread_current() != idle_thread && t->priority > thread_current()->priority)
+    
+   if(thread_current() != idle_thread && t->priority > thread_current()->priority)
        thread_yield();
    intr_set_level (old_level);
 }
