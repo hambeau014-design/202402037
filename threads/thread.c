@@ -625,4 +625,12 @@ aging_ready_threads(void)
          }
       }
       list_sort(&ready_list, thread_cmp_priority, NULL);
+
+      struct thread *cur = thread_current();
+      if(!liset_empty(&ready_list))
+      {
+         struct thread *front = list_entry(list_front(&ready_list), struct thread, elem);
+         if(front->priority > cur->priority)
+            thread_yield();
+      }
 }
