@@ -614,10 +614,6 @@ thread_cmp_priority(const struct list_elem *a, const struct list_elem *b, void *
    return t_a->priority > t_b->priority;
 }
 
-#define TIME_SLICE_Q0 2
-#define TIME_SLICE_Q1 4
-#define TIME_SLICE_Q2 8
-#define AGE_LIMIT 20
 void
 aging_ready_threads(void)
 {
@@ -647,6 +643,10 @@ aging_ready_threads(void)
 }
 /*열심히 구현했건만....*/
 
+#define TIME_SLICE_Q0 2
+#define TIME_SLICE_Q1 4
+#define TIME_SLICE_Q2 8
+#define AGE_LIMIT 20
 void
 mlfq_update(void)
 {
