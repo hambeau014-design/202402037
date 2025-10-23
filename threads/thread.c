@@ -606,3 +606,23 @@ thread_cmp_priority(const struct list_elem *a, const struct list_elem *b, void *
    struct thread *t_b = list_entry(b, struct thread, elem);
    return t_a->priority > t_b->priority;
 }
+
+void
+aging_ready_threads(void)
+{
+   struct list_elem *e;
+
+   for(e=list_begin(&ready_list); e != list_end(&ready_list); e = list_next(e))
+      {
+         struct thread *t = liest_entry(e, struct thread, elem);
+         t->age++;
+
+         if(t->age>=20)
+         {
+            if(t->priority < PRI_MAX)
+               t->prioriy++;
+            t->age = 0;
+         }
+      }
+      list_sort(&ready_list, thread_cmp_priority, NULL);
+}
