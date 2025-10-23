@@ -90,7 +90,7 @@ struct thread
     int priority;              /* Priority. */
     struct list_elem allelem;  /* List element for all threads list. */
     int age;                   /* Aging count. */
-    int queue_level;           /* mfqs count. */
+    int queue_level;           /* mlfqs count. */
     int age[3];
 
     /* Shared between thread.c and synch.c. */
