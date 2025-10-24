@@ -532,12 +532,12 @@ next_thread_to_run (void)
         return idle_thread;
     else
         return list_entry (list_pop_front (&ready_list), struct thread, elem);*/
-   for(int i =0;i<3;i++)
-      {
-         if(!list_empty(&mlfq[i]))
-            return list_entry(list_pop_front(&mlfq[i], struct thread, elem);
-      }
-   return idle_thread;
+  for (int i = 0; i < 3; i++) {
+        if (!list_empty (&mlfq[i])) {
+            return list_entry (list_pop_front (&mlfq[i]), struct thread, elem);
+        }
+    }
+    return idle_thread;
 }
 
 /* Completes a thread switch by activating the new thread's page
@@ -668,40 +668,41 @@ aging_ready_threads(void)
 #define TIME_SLICE_Q1 4
 #define TIME_SLICE_Q2 8
 #define AGE_LIMIT 20
+
 void
 mlfq_update(void)
 {
-   if(cur != idle_thread)
-   {
-      cur->recent_cpu++;
-      int slice_limit = (cur->queue_level == 0)?TIME_SLICE_Q0 : (cur->queue_level == 1)?TIME_SLICE_Q1:TIME_SLICE_Q2;
+    struct thread *cur = thread_current();
+    if (cur != idle_thread) {
+        cur->recent_cpu++;
+        int slice_limit = (cur->queue_level == 0) ? TIME_SLICE_Q0
+                         : (cur->queue_level == 1) ? TIME_SLICE_Q1
+                         : TIME_SLICE_Q2;
 
-      if(cur->recent_cpu >= slice_limit)
-      {
-         if(cur->queue_level <2)
-            cur->queue_level++;
-         cur->recent_cpu = 0;
-         thread_yield();
-      }
-   }
+        if (cur->recent_cpu >= slice_limit) {
+            if (cur->queue_level < 2)
+                cur->queue_level++;
+            cur->recent_cpu = 0;
+            thread_yield ();
+            return;
+        }
+    }
+    for (int i = 0; i < 3; i++) {
+        struct list_elem *e = list_begin (&mlfq[i]);
+        while (e != list_end (&mlfq[i])) {
+            struct list_elem *next = list_next (e);
+            struct thread *t = list_entry (e, struct thread, elem);
 
-   for(int i =0; i<3; i++)
-      {
-         struct list_elem *e=list_begin(&mlfq[i]);
-         while(e != list_end(&mlfq[i])
-            {
-            struct thread *t = list_entry(e, struct thread, elem);
             t->age[i]++;
 
-            if(t->age[i] >= AGE_LIMIT && t->queue_level > 0)
-            {
-               e=list_remove(e);
-               t->queue_level--;
-               t->age[i] = 0;
-               list_push_back(&mlfq[t->queue_level],&t->elem);
-            }else{
-               e=list_next(e);
+            if (t->age[i] >= AGE_LIMIT && t->queue_level > 0) {
+                list_remove (&t->elem);
+                t->queue_level--;
+                t->age[0] = t->age[1] = t->age[2] = 0;
+                list_push_back (&mlfq[t->queue_level], &t->elem);
             }
-         }
-      }
+
+            e = next;
+        }
+    }
 }
