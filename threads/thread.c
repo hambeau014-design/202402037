@@ -341,8 +341,12 @@ thread_yield (void)
     ASSERT (!intr_context ());
 
     old_level = intr_disable ();
-    if (cur != idle_thread)
-        list_push_back (&ready_list, &cur->elem);
+    if (cur != idle_thread) {
+        if (cur->queue_level == -1)
+            cur->queue_level = 0;
+        list_push_back (&mlfq[cur->queue_level], &cur->elem);
+    }
+        
     cur->status = THREAD_READY;
     schedule ();
     intr_set_level (old_level);
