@@ -250,22 +250,25 @@ void
 thread_unblock (struct thread *t)
 {
     enum intr_level old_level;
-
     ASSERT (is_thread (t));
 
     old_level = intr_disable ();
     ASSERT (t->status == THREAD_BLOCKED);
     
-   t->status = THREAD_READY;
-   t->age[0] = t->age[1] = t->age[2] = 0;
-   t->queue_level = 0;
+    t->status = THREAD_READY;
+   
+    if (t->queue_level == -1) {
+        t->queue_level = 0;
+        t->age[0] = t->age[1] = t->age[2] = 0;
+    }
 
-   list_insert_ordered(&mlfq[0], &t->elem, thread_cmp_priority, NULL);
+    list_push_back(&mlfq[t->queue_level], &t->elem);
+
+    if (thread_current() != idle_thread && 
+        t->queue_level < thread_current()->queue_level)
+        thread_yield();
 
     intr_set_level (old_level);
-    
-   if(thread_current() != idle_thread && t->priority > thread_current()->priority)
-       thread_yield();
 }
 
 /* Returns the name of the running thread. */
