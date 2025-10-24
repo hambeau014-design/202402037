@@ -501,6 +501,12 @@ init_thread (struct thread *t, const char *name, int priority)
     t->stack = (uint8_t *)t + PGSIZE;
     t->priority = priority;
     t->magic = THREAD_MAGIC;
+
+    /* MLFQ / bookkeeping defaults */
+    t->queue_level = -1;
+    t->recent_cpu = 0;
+    t->age[0] = t->age[1] = t->age[2] = 0;
+   
     list_push_back (&all_list, &t->allelem);
 }
 
