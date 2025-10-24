@@ -638,30 +638,40 @@ thread_cmp_priority(const struct list_elem *a, const struct list_elem *b, void *
 void
 aging_ready_threads(void)
 {
-   struct list_elem *e;
+    for (int i = 0; i < 3; i++) {
+        struct list_elem *e = list_begin (&mlfq[i]);
+        while (e != list_end (&mlfq[i])) {
+            struct list_elem *next = list_next(e);
+            struct thread *t = list_entry (e, struct thread, elem);
 
-   for(e=list_begin(&ready_list); e != list_end(&ready_list); e = list_next(e))
-      {
-         struct thread *t = liest_entry(e, struct thread, elem);
-         t->age++;
+            /* 각 스레드는 자신이 현재 머물러있는 큐 레벨에서만 에이징을 증가시킴 */
+            if (t->queue_level == i)
+                t->age[i]++;
 
-         if(t->age>=20)
-         {
-            if(t->priority < PRI_MAX)
-               t->prioriy++;
-            t->age = 0;
-         }
-      }
-      list_sort(&ready_list, thread_cmp_priority, NULL);
+            if (t->age[i] >= AGE_LIMIT && t->queue_level > 0) {
+                /* 상위 큐로 승격 (queue_level--). list_remove는 e를 무효화하므로 next를 미리 저장 */
+                list_remove (&t->elem);
+                t->queue_level--;
+                t->age[0] = t->age[1] = t->age[2] = 0; /* 승격 뒤 에이징 리셋 */
+                list_push_back (&mlfq[t->queue_level], &t->elem);
+            }
 
-      struct thread *cur = thread_current();
-      if(!liset_empty(&ready_list))
-      {
-         struct thread *front = list_entry(list_front(&ready_list), struct thread, elem);
-         if(front->priority > cur->priority)
-            thread_yield();
-      }
+            e = next;
+        }
+    }
+
+    /* 현재 실행중인 스레드와 새로 front에 있는 스레드 비교하여 필요시 선점 */
+    struct thread *cur = thread_current ();
+    for (int i = 0; i < 3; i++) {
+        if (!list_empty (&mlfq[i])) {
+            struct thread *front = list_entry (list_front (&mlfq[i]), struct thread, elem);
+            if (front->queue_level < cur->queue_level)
+                thread_yield ();
+            break;
+        }
+    }
 }
+
 /*열심히 구현했건만....*/
 
 #define TIME_SLICE_Q0 2
