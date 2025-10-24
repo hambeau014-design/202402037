@@ -260,11 +260,12 @@ thread_unblock (struct thread *t)
    t->age[0] = t->age[1] = t->age[2] = 0;
    t->queue_level = 0;
 
-   list_push_back(&mlfq[0], &t->elem);
+   list_insert_ordered(&mlfq[0], &t->elem, thread_cmp_priority, NULL);
+
+    intr_set_level (old_level);
     
    if(thread_current() != idle_thread && t->priority > thread_current()->priority)
        thread_yield();
-   intr_set_level (old_level);
 }
 
 /* Returns the name of the running thread. */
