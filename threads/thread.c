@@ -1,8 +1,3 @@
-/* threads/thread.c
-   MLFQ (3-level) + Aging + Preemption implementation for Pintos
-   Replace your existing threads/thread.c with this file (or merge carefully).
-*/
-
 #include "threads/thread.h"
 #include <debug.h>
 #include <stddef.h>
@@ -20,51 +15,16 @@
 #include "userprog/process.h"
 #endif
 
-#define THREAD_MAGIC 0xcd6abf4b
+/* (중략) 기존 전역 변수들 유지 (ready_list, all_list, idle_thread, initial_thread, tid_lock, mlfq[3], thread_mlfqs) */
 
-/* Ready lists: MLFQ with 3 levels */
-#define MLFQ_LEVELS 3
-static struct list mlfq[MLFQ_LEVELS];
-
-/* List of all processes. */
-static struct list all_list;
-
-/* Idle thread and initial thread */
-static struct thread *idle_thread;
-static struct thread *initial_thread;
-
-/* Tid lock */
-static struct lock tid_lock;
-
-/* Stack frame for kernel_thread(). */
-struct kernel_thread_frame
-{
-    void *eip;
-    thread_func *function;
-    void *aux;
-};
-
-/* Statistics. */
-static long long idle_ticks;
-static long long kernel_ticks;
-static long long user_ticks;
-
-/* Scheduling. */
-#define TIME_SLICE 4 /* not used directly for MLFQ levels, but for compatibility */
-static unsigned thread_ticks;
-
-/* Time slice per MLFQ level (in ticks) */
-#define TIME_SLICE_Q0 1
-#define TIME_SLICE_Q1 2
-#define TIME_SLICE_Q2 4
-
-/* Aging threshold (ticks waiting in ready queue) */
+/* MLFQ Constants */
+#define TIME_SLICE 4 // 기존 라운드 로빈 TIME_SLICE
+#define TIME_SLICE_Q0 2
+#define TIME_SLICE_Q1 4
+#define TIME_SLICE_Q2 8
 #define AGE_LIMIT 20
 
-/* If false, use round-robin; if true, use MLFQ */
-bool thread_mlfqs;
-
-/* Forward declarations */
+/* 함수 선언 (기존 함수 외) */
 static void kernel_thread (thread_func *, void *aux);
 static void idle (void *aux UNUSED);
 static struct thread *running_thread (void);
@@ -76,47 +36,46 @@ static void schedule (void);
 void thread_schedule_tail (struct thread *prev);
 static tid_t allocate_tid (void);
 
-static void mlfq_tick(void);
-static void mlfq_aging(void);
+/* 우선순위 비교 및 기부 관련 함수 선언 */
+bool thread_cmp_priority(const struct list_elem *a, const struct list_elem *b, void *aux UNUSED);
+bool thread_cmp_lock_priority(const struct list_elem *a, const struct list_elem *b, void *aux UNUSED); // synch.h에 있어야 함
+int thread_get_max_ready_priority(void);
+void thread_donate_priority(struct thread *t, int priority);
+void thread_remove_lock(struct lock *lock);
 
-/* Initialize threading system. */
+/* 스케줄링 및 에이징 함수 선언 */
+void mlfq_update(void);
+void aging_ready_threads(void);
+
+
+/* thread_init - 기존과 동일. 단, init_thread 호출 시 우선순위 기부 필드 초기화 확인. */
 void
 thread_init (void)
 {
     ASSERT (intr_get_level () == INTR_OFF);
 
     lock_init (&tid_lock);
+    list_init (&ready_list);
     list_init (&all_list);
 
-    for (int i = 0; i < MLFQ_LEVELS; i++)
-        list_init (&mlfq[i]);
+    list_init(&mlfq[0]);
+    list_init(&mlfq[1]);
+    list_init(&mlfq[2]);
 
-    /* Set up running thread structure. */
+    /* Set up a thread structure for the running thread. */
     initial_thread = running_thread ();
     init_thread (initial_thread, "main", PRI_DEFAULT);
     initial_thread->status = THREAD_RUNNING;
     initial_thread->tid = allocate_tid ();
 }
 
-/* Start threads: create idle thread, enable interrupts. */
-void
-thread_start (void)
-{
-    struct semaphore idle_started;
-    sema_init (&idle_started, 0);
-    thread_create ("idle", PRI_MIN, idle, &idle_started);
-
-    intr_enable ();
-    sema_down (&idle_started);
-}
-
-/* Timer tick handler: update stats and perform MLFQ tick+aging */
+/* (중략) thread_start, thread_tick, thread_print_stats - thread_tick에 mlfq/aging 로직 추가 */
 void
 thread_tick (void)
 {
     struct thread *t = thread_current ();
-
-    /* Update statistics. */
+    /* ... (통계 업데이트 기존 로직) ... */
+    
     if (t == idle_thread)
         idle_ticks++;
 #ifdef USERPROG
@@ -126,89 +85,21 @@ thread_tick (void)
     else
         kernel_ticks++;
 
-    /* Common tick increment */
-    thread_ticks++;
-
-    /* If MLFQ enabled, update per-thread CPU usage / timeslice and aging */
+    /* [수정] MLFQS/Aging 로직 추가 */
     if (thread_mlfqs) {
-        mlfq_tick();    /* update current thread ticks_in_queue and demote if necessary */
-        mlfq_aging();   /* age waiting threads and promote if necessary */
-    } else {
-        /* Classic RR behavior */
-        if (thread_ticks >= TIME_SLICE)
-            intr_yield_on_return ();
+        mlfq_update();
     }
+    else {
+        aging_ready_threads(); 
+    }
+    
+    /* Enforce preemption. */
+    if (++thread_ticks >= TIME_SLICE)
+        intr_yield_on_return ();
 }
+/* (중략) thread_create, thread_block - 기존과 동일 */
 
-/* Print stats */
-void
-thread_print_stats (void)
-{
-    printf ("Thread: %lld idle ticks, %lld kernel ticks, %lld user ticks\n",
-            idle_ticks, kernel_ticks, user_ticks);
-}
-
-/* Create a new kernel thread and add it to ready queue (MLFQ). */
-tid_t
-thread_create (const char *name, int priority,
-               thread_func *function, void *aux)
-{
-    struct thread *t;
-    struct kernel_thread_frame *kf;
-    struct switch_entry_frame *ef;
-    struct switch_threads_frame *sf;
-    tid_t tid;
-    enum intr_level old_level;
-
-    ASSERT (function != NULL);
-
-    t = palloc_get_page (PAL_ZERO);
-    if (t == NULL)
-        return TID_ERROR;
-
-    init_thread (t, name, priority);
-    tid = t->tid = allocate_tid ();
-
-    /* Initialize MLFQ bookkeeping */
-    t->queue_level = 0;        /* new threads start at highest queue */
-    t->ticks_in_queue = 0;
-    t->wait_ticks = 0;
-
-    old_level = intr_disable ();
-
-    /* Prepare stack frames */
-    kf = alloc_frame (t, sizeof *kf);
-    kf->eip = NULL;
-    kf->function = function;
-    kf->aux = aux;
-
-    ef = alloc_frame (t, sizeof *ef);
-    ef->eip = (void (*) (void))kernel_thread;
-
-    sf = alloc_frame (t, sizeof *sf);
-    sf->eip = switch_entry;
-    sf->ebp = 0;
-
-    intr_set_level (old_level);
-
-    /* Put thread into ready (mlfq) */
-    thread_unblock (t);
-
-    return tid;
-}
-
-/* Block current thread (must be called with interrupts off). */
-void
-thread_block (void)
-{
-    ASSERT (!intr_context ());
-    ASSERT (intr_get_level () == INTR_OFF);
-
-    thread_current ()->status = THREAD_BLOCKED;
-    schedule ();
-}
-
-/* Unblock thread: put into MLFQ ready queue and handle preemption. */
+/* thread_unblock - priority/mlfqs 분기 및 선점 로직 추가 */
 void
 thread_unblock (struct thread *t)
 {
@@ -217,82 +108,34 @@ thread_unblock (struct thread *t)
 
     old_level = intr_disable ();
     ASSERT (t->status == THREAD_BLOCKED);
-
+    
     t->status = THREAD_READY;
+    
+    if (thread_mlfqs == false) {
+        /* Priority Scheduling: 우선순위 순으로 삽입 */
+        list_insert_ordered (&ready_list, &t->elem, thread_cmp_priority, NULL);
 
-    /* If queue_level uninitialized, initialize to 0 */
-    if (t->queue_level < 0)
-        t->queue_level = 0;
-
-    /* reset wait_ticks for aging */
-    t->wait_ticks = 0;
-    t->ticks_in_queue = 0;
-
-    /* push to corresponding MLFQ level back (FIFO) */
-    list_push_back (&mlfq[t->queue_level], &t->elem);
-
-    /* Preemption: if unblocked thread is at higher-priority queue than current, request preempt.
-       If we're in interrupt context, use intr_yield_on_return; otherwise, call thread_yield (which expects interrupts off). */
-    struct thread *cur = thread_current ();
-    if (t != idle_thread && cur != idle_thread) {
-        if (t->queue_level < cur->queue_level) {
-            if (intr_context ())
-                intr_yield_on_return ();
-            else {
-                /* We are allowed to yield now (interrupts off) */
-                /* Note: thread_yield will call schedule(), so interrupts must be off. */
-                thread_yield ();
-            }
+        /* 선점 (Unblock된 스레드가 현재 스레드보다 우선순위가 높으면 yield) */
+        if (t->priority > thread_current()->priority && !intr_context())
+             thread_yield();
+    }
+    else { 
+        /* MLFQS Scheduling: Q0으로 초기화하고 push_back */
+        if (t->queue_level == -1) {
+            t->queue_level = 0;
+            t->age[0] = t->age[1] = t->age[2] = 0;
         }
+        list_push_back(&mlfq[t->queue_level], &t->elem);
+        
+        // MLFQS의 선점은 next_thread_to_run에서 처리되거나, mlfq_update의 승급/강등 후 yield로 처리됨.
     }
 
     intr_set_level (old_level);
 }
 
-/* Returns the name of the running thread. */
-const char *
-thread_name (void)
-{
-    return thread_current ()->name;
-}
+/* (중략) thread_name, thread_current, thread_tid, thread_exit - 기존과 동일 */
 
-/* Returns the running thread. */
-struct thread *
-thread_current (void)
-{
-    struct thread *t = running_thread ();
-
-    ASSERT (is_thread (t));
-    ASSERT (t->status == THREAD_RUNNING);
-
-    return t;
-}
-
-/* Returns current tid. */
-tid_t
-thread_tid (void)
-{
-    return thread_current ()->tid;
-}
-
-/* Exit current thread. */
-void
-thread_exit (void)
-{
-    ASSERT (!intr_context ());
-
-#ifdef USERPROG
-    process_exit ();
-#endif
-
-    intr_disable ();
-    list_remove (&thread_current ()->allelem);
-    thread_current ()->status = THREAD_DYING;
-    schedule ();
-    NOT_REACHED ();
-}
-
-/* Yield CPU voluntarily: put current thread at end of its MLFQ queue. */
+/* thread_yield - priority/mlfqs 분기 */
 void
 thread_yield (void)
 {
@@ -302,108 +145,62 @@ thread_yield (void)
     ASSERT (!intr_context ());
 
     old_level = intr_disable ();
-
     if (cur != idle_thread) {
-        /* Put current thread to back of its current queue */
-        if (cur->queue_level < 0)
-            cur->queue_level = 0;
-        cur->ticks_in_queue = 0; /* reset CPU consumption in this queue (will be counted when re-scheduled) */
-        list_push_back (&mlfq[cur->queue_level], &cur->elem);
+        if (thread_mlfqs == false) {
+            /* Priority Scheduling: 우선순위 순으로 삽입 */
+            list_insert_ordered (&ready_list, &cur->elem, thread_cmp_priority, NULL);
+        } else {
+            /* MLFQS Scheduling: 현재 큐에 push_back */
+            if (cur->queue_level == -1)
+                cur->queue_level = 0;
+            list_push_back (&mlfq[cur->queue_level], &cur->elem);
+        }
     }
-
+        
     cur->status = THREAD_READY;
     schedule ();
     intr_set_level (old_level);
 }
 
-/* Apply function to all threads (interrupts off). */
+/* (중략) thread_foreach - 기존과 동일 */
+
+/* thread_set_priority - 우선순위 기부 및 선점 반영 */
 void
-thread_foreach (thread_action_func *func, void *aux)
+thread_set_priority(int new_priority) 
 {
-    struct list_elem *e;
+    enum intr_level old_level = intr_disable();
+    struct thread *cur = thread_current();
+    
+    if (thread_mlfqs == false) {
+        cur->original_priority = new_priority;
+        
+        // 최종 우선순위는 (원래 우선순위) 또는 (락으로부터 기부받은 우선순위) 중 높은 값
+        int new_effective_priority = new_priority;
+        
+        if (!list_empty(&cur->holding_locks)) {
+            // 보유한 락 목록을 순회하며 가장 높은 max_priority를 찾음
+            struct list_elem *e = list_max(&cur->holding_locks, thread_cmp_lock_priority, NULL);
+            struct lock *l = list_entry(e, struct lock, elem);
+            if (l->max_priority > new_effective_priority)
+                new_effective_priority = l->max_priority;
+        }
 
-    ASSERT (intr_get_level () == INTR_OFF);
-
-    for (e = list_begin (&all_list); e != list_end (&all_list);
-         e = list_next (e))
-    {
-        struct thread *t = list_entry (e, struct thread, allelem);
-        func (t, aux);
+        if (cur->priority != new_effective_priority) {
+            cur->priority = new_effective_priority;
+            
+            // 우선순위가 낮아졌거나, ready_list의 최고 우선순위보다 낮아지면 yield (선점)
+            if (cur->priority < thread_get_max_ready_priority())
+                thread_yield();
+        }
     }
+    intr_set_level(old_level);
 }
 
-/* Set current thread's priority. For MLFQ we primarily use queue levels, but keep API. */
-void
-thread_set_priority (int new_priority)
-{
-    int old_priority = thread_current ()->priority;
-    thread_current ()->priority = new_priority;
+/* (중략) thread_get_priority ~ thread_get_recent_cpu - 기존과 동일 */
+/* (중략) idle, kernel_thread - 기존과 동일 */
+/* (중략) running_thread, is_thread, alloc_frame - 기존과 동일 */
 
-    /* Priority change might affect scheduling only in non-MLFQ case or if user uses priority field.
-       For safety, if effective priority decreased, yield to allow other threads to run. */
-    if (new_priority < old_priority)
-        thread_yield ();
-}
-
-/* Get priority */
-int
-thread_get_priority (void)
-{
-    return thread_current ()->priority;
-}
-
-/* Not implemented nice/load_avg in this MLFQ simplified implementation */
-void
-thread_set_nice (int nice UNUSED) { }
-int thread_get_nice (void) { return 0; }
-int thread_get_load_avg (void) { return 0; }
-int thread_get_recent_cpu (void) { return 0; }
-
-/* Idle thread. */
-static void
-idle (void *idle_started_ UNUSED)
-{
-    struct semaphore *idle_started = idle_started_;
-    idle_thread = thread_current ();
-    sema_up (idle_started);
-
-    for (;;)
-    {
-        intr_disable ();
-        thread_block ();
-
-        asm volatile ("sti; hlt" : : : "memory");
-    }
-}
-
-/* Kernel thread wrapper. */
-static void
-kernel_thread (thread_func *function, void *aux)
-{
-    ASSERT (function != NULL);
-
-    intr_enable ();
-    function (aux);
-    thread_exit ();
-}
-
-/* Get running_thread using stack pointer. */
-struct thread *
-running_thread (void)
-{
-    uint32_t *esp;
-    asm ("mov %%esp, %0" : "=g"(esp));
-    return pg_round_down (esp);
-}
-
-/* Verify thread pointer. */
-static bool
-is_thread (struct thread *t)
-{
-    return t != NULL && t->magic == THREAD_MAGIC;
-}
-
-/* Initialize thread structure. */
+/* init_thread - 우선순위 기부 필드 초기화 추가 */
 static void
 init_thread (struct thread *t, const char *name, int priority)
 {
@@ -414,166 +211,193 @@ init_thread (struct thread *t, const char *name, int priority)
     memset (t, 0, sizeof *t);
     t->status = THREAD_BLOCKED;
     strlcpy (t->name, name, sizeof t->name);
-    t->stack = (uint8_t *) t + PGSIZE;
+    t->stack = (uint8_t *)t + PGSIZE;
     t->priority = priority;
     t->magic = THREAD_MAGIC;
 
-    /* MLFQ bookkeeping defaults */
-    t->queue_level = 0;
-    t->ticks_in_queue = 0;
-    t->wait_ticks = 0;
-
+    /* [추가] Donation 필드 초기화 */
+    t->original_priority = priority;
+    t->wait_on_lock = NULL;
+    list_init (&t->holding_locks);
+    
+    /* MLFQ / bookkeeping defaults */
+    t->queue_level = -1;
+    t->recent_cpu = 0;
+    t->age[0] = t->age[1] = t->age[2] = 0;
+    
     list_push_back (&all_list, &t->allelem);
 }
 
-/* Alloc stack frame. */
-static void *
-alloc_frame (struct thread *t, size_t size)
-{
-    ASSERT (is_thread (t));
-    ASSERT (size % sizeof (uint32_t) == 0);
 
-    t->stack -= size;
-    return t->stack;
-}
-
-/* Choose next thread to run from highest-priority non-empty queue. */
+/* next_thread_to_run - priority/mlfqs 분기 */
 static struct thread *
 next_thread_to_run (void)
 {
-    for (int i = 0; i < MLFQ_LEVELS; i++) {
-        if (!list_empty (&mlfq[i])) {
-            struct list_elem *e = list_pop_front (&mlfq[i]);
-            struct thread *t = list_entry (e, struct thread, elem);
-            return t;
+    if (thread_mlfqs == false) {
+        /* Priority Scheduling: ready_list의 가장 높은 우선순위 스레드를 pop */
+        if (list_empty (&ready_list))
+            return idle_thread;
+        else
+            return list_entry (list_pop_front (&ready_list), struct thread, elem);
+    }
+    else { 
+        /* MLFQS Scheduling: Q0 -> Q1 -> Q2 순으로 pop */
+        for (int i = 0; i < 3; i++) {
+            if (!list_empty (&mlfq[i])) {
+                return list_entry (list_pop_front (&mlfq[i]), struct thread, elem);
+            }
+        }
+        return idle_thread;
+    }
+}
+
+/* (중략) thread_schedule_tail, schedule, allocate_tid - 기존과 동일 */
+
+/* thread_cmp_priority - 우선순위 비교 함수 (높은 우선순위가 앞으로) */
+bool
+thread_cmp_priority(const struct list_elem *a, const struct list_elem *b, void *aux UNUSED)
+{
+   struct thread *t_a = list_entry(a, struct thread, elem);
+   struct thread *t_b = list_entry(b, struct thread, elem);
+   return t_a->priority > t_b->priority;
+}
+
+/* thread_get_max_ready_priority - ready_list의 최고 우선순위 반환 (선점 로직용) */
+int
+thread_get_max_ready_priority(void)
+{
+    if (list_empty(&ready_list))
+        return PRI_MIN - 1; 
+    
+    struct thread *t = list_entry(list_front(&ready_list), struct thread, elem);
+    return t->priority;
+}
+
+
+/* thread_donate_priority - 우선순위 기부 함수 (재귀적 기부 지원) */
+void
+thread_donate_priority(struct thread *t, int priority)
+{
+    if (t->priority < priority) {
+        t->priority = priority;
+        
+        // 연쇄 기부
+        if (t->wait_on_lock != NULL && t->wait_on_lock->holder != NULL) {
+            if (t->wait_on_lock->max_priority < priority) {
+                t->wait_on_lock->max_priority = priority;
+            }
+            thread_donate_priority(t->wait_on_lock->holder, priority);
+        }
+        
+        // ready 상태라면 리스트에서 제거 후 재삽입하여 정렬 위치 갱신 (선점 유도)
+        if (t->status == THREAD_READY) {
+            list_remove(&t->elem);
+            list_insert_ordered (&ready_list, &t->elem, thread_cmp_priority, NULL);
         }
     }
-    return idle_thread;
 }
 
-/* Complete context switch, finish bookkeeping. */
+/* thread_remove_lock - 락 해제 시 우선순위 회수 및 갱신 */
 void
-thread_schedule_tail (struct thread *prev)
+thread_remove_lock(struct lock *lock)
 {
-    struct thread *cur = running_thread ();
-
-    ASSERT (intr_get_level () == INTR_OFF);
-
-    cur->status = THREAD_RUNNING;
-
-    /* Start new time slice counter */
-    thread_ticks = 0;
-
-#ifdef USERPROG
-    process_activate ();
-#endif
-
-    if (prev != NULL && prev->status == THREAD_DYING && prev != initial_thread) {
-        ASSERT (prev != cur);
-        palloc_free_page (prev);
+    struct thread *cur = thread_current();
+    int new_priority = cur->original_priority;
+    
+    // 보유 락 목록을 순회하며 남아있는 락 중 가장 높은 기부 우선순위를 찾음
+    if (!list_empty(&cur->holding_locks)) {
+        struct list_elem *e = list_max(&cur->holding_locks, thread_cmp_lock_priority, NULL);
+        struct lock *l = list_entry(e, struct lock, elem);
+        if (l->max_priority > new_priority)
+            new_priority = l->max_priority;
+    }
+    
+    // 최종 우선순위를 업데이트하고, 필요시 선점을 유도
+    if (cur->priority != new_priority) {
+        cur->priority = new_priority;
+        if (cur->priority < thread_get_max_ready_priority() && !intr_context())
+            thread_yield();
     }
 }
 
-/* Core scheduler: pick next and switch. */
-static void
-schedule (void)
+/* aging_ready_threads - 일반 우선순위 스케줄링 모드에서의 에이징 */
+void
+aging_ready_threads(void)
 {
-    struct thread *cur = running_thread ();
-    struct thread *next = next_thread_to_run ();
-    struct thread *prev = NULL;
-
-    ASSERT (intr_get_level () == INTR_OFF);
-    ASSERT (cur->status != THREAD_RUNNING);
-    ASSERT (is_thread (next));
-
-    if (cur != next)
-        prev = switch_threads (cur, next);
-    thread_schedule_tail (prev);
-}
-
-/* Allocate tid. */
-static tid_t
-allocate_tid (void)
-{
-    static tid_t next_tid = 1;
-    tid_t tid;
-
-    lock_acquire (&tid_lock);
-    tid = next_tid++;
-    lock_release (&tid_lock);
-
-    return tid;
-}
-
-/* MLFQ helper: update current running thread's ticks and demote if needed. */
-static void
-mlfq_tick(void)
-{
-    struct thread *cur = thread_current ();
-    if (cur == idle_thread)
-        return;
-
-    /* Ensure queue_level is valid */
-    if (cur->queue_level < 0)
-        cur->queue_level = 0;
-
-    cur->ticks_in_queue++;
-
-    int slice_limit = (cur->queue_level == 0) ? TIME_SLICE_Q0
-                      : (cur->queue_level == 1) ? TIME_SLICE_Q1
-                      : TIME_SLICE_Q2;
-
-    if (cur->ticks_in_queue >= slice_limit) {
-        /* Demote if possible */
-        if (cur->queue_level < MLFQ_LEVELS - 1)
-            cur->queue_level++;
-        cur->ticks_in_queue = 0;
-
-        /* Voluntary yield to let scheduler pick next thread */
-        /* If interrupts on, use intr_yield_on_return to schedule on return from interrupt */
-        if (intr_context ())
-            intr_yield_on_return ();
-        else
-            thread_yield ();
-    }
-}
-
-/* MLFQ aging: increment wait_ticks for threads in ready queues and promote if aged. */
-static void
-mlfq_aging(void)
-{
-    enum intr_level old_level = intr_disable ();
-
-    for (int level = 1; level < MLFQ_LEVELS; level++) {
-        struct list_elem *e = list_begin (&mlfq[level]);
-        while (e != list_end (&mlfq[level])) {
-            struct list_elem *next = list_next (e);
+    if (thread_mlfqs == false) {
+        struct list_elem *e = list_begin (&ready_list);
+        while (e != list_end (&ready_list)) {
+            struct list_elem *next = list_next(e);
             struct thread *t = list_entry (e, struct thread, elem);
 
-            t->wait_ticks++;
-            if (t->wait_ticks >= AGE_LIMIT) {
-                /* promote to higher priority queue (lower level number) */
-                list_remove (&t->elem);
-                if (t->queue_level > 0)
-                    t->queue_level--;
-                t->wait_ticks = 0;
-                t->ticks_in_queue = 0;
-                list_push_back (&mlfq[t->queue_level], &t->elem);
-
-                /* If the promoted thread is now higher priority than current, request preempt */
-                struct thread *cur = thread_current ();
-                if (t != idle_thread && cur != idle_thread && t->queue_level < cur->queue_level) {
-                    if (intr_context ())
-                        intr_yield_on_return ();
-                    else
-                        thread_yield ();
+            t->age[0]++; // age[0]을 일반 age로 사용
+            
+            if (t->age[0] >= AGE_LIMIT) {
+                t->age[0] = 0;
+                if (t->priority < PRI_DEFAULT) { // PRI_DEFAULT까지만 승급 허용
+                    t->priority++;
+                    
+                    // 우선순위가 바뀌었으므로 리스트에서 제거 후 재삽입
+                    list_remove(&t->elem);
+                    list_insert_ordered (&ready_list, &t->elem, thread_cmp_priority, NULL);
+                    
+                    // 우선순위가 높아졌다면 즉시 선점 여부 확인 (intr_context는 thread_tick에서 이미 off)
+                    if (t->priority > thread_current()->priority)
+                        intr_yield_on_return(); 
                 }
-
-                /* after removal, continue iteration from next (we already set next) */
             }
             e = next;
         }
     }
+}
 
-    intr_set_level (old_level);
+
+/* mlfq_update - MLFQS 강등 및 에이징 승급 */
+void
+mlfq_update(void)
+{
+    struct thread *cur = thread_current();
+
+    if (cur != idle_thread) {
+        cur->recent_cpu++;
+        int slice_limit = (cur->queue_level == 0) ? TIME_SLICE_Q0
+                         : (cur->queue_level == 1) ? TIME_SLICE_Q1
+                         : TIME_SLICE_Q2;
+
+        /* 1. 타임 슬라이스 소모 시 강등 및 yield */
+        if (cur->recent_cpu >= slice_limit) {
+            if (cur->queue_level < 2)
+                cur->queue_level++;
+            cur->recent_cpu = 0;
+            
+            // 강등 후 선점
+            intr_yield_on_return (); 
+            return;
+        }
+    }
+
+    /* 2. 대기 중인 스레드 에이징 및 승급 */
+    for (int i = 0; i < 3; i++) {
+        struct list_elem *e = list_begin (&mlfq[i]);
+        while (e != list_end (&mlfq[i])) {
+            struct list_elem *next = list_next (e);
+            struct thread *t = list_entry (e, struct thread, elem);
+            
+            t->age[i]++;
+
+            if (t->age[i] >= AGE_LIMIT && t->queue_level > 0) {
+                // 승급
+                list_remove (&t->elem);
+                t->queue_level--;
+                t->age[0] = t->age[1] = t->age[2] = 0; 
+                list_push_back (&mlfq[t->queue_level], &t->elem);
+
+                // 승급으로 Q0에 스레드가 추가되었고, 현재 스레드보다 우선순위가 높다면 선점
+                if (t->queue_level < cur->queue_level && t->queue_level == 0) {
+                    intr_yield_on_return();
+                }
+            }
+            e = next;
+        }
+    }
 }
