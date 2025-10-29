@@ -146,6 +146,30 @@ thread_tick (void)
     /* Enforce preemption. */
     if (++thread_ticks >= TIME_SLICE)
         intr_yield_on_return ();
+
+   /* Enforce preemption. */
+    if (thread_mlfqs) {
+        struct thread *cur = thread_current();
+        if (cur != idle_thread) {
+            cur->recent_cpu++;
+            int slice_limit = (cur->queue_level == 0) ? TIME_SLICE_Q0
+                              : (cur->queue_level == 1) ? TIME_SLICE_Q1
+                              : TIME_SLICE_Q2;
+
+            /* 큐별 타임 슬라이스 체크 */
+            if (cur->recent_cpu >= slice_limit) {
+                /* 타임 슬라이스 만료*/
+                if (cur->queue_level < 2)
+                    cur->queue_level++;
+                cur->recent_cpu = 0;
+                intr_yield_on_return (); 
+            }
+        }
+    } else {
+        /* Round-Robin 모드 (기존 로직) */
+        if (++thread_ticks >= TIME_SLICE)
+            intr_yield_on_return ();
+    }
 }
 
 /* Prints thread statistics. */
