@@ -143,30 +143,40 @@ thread_tick (void)
     else
         kernel_ticks++;
 
-    /* Enforce preemption. */
-    if (++thread_ticks >= TIME_SLICE)
-        intr_yield_on_return ();
-
-   /* Enforce preemption. */
+    /* --- MLFQ / Round-Robin Scheduling Logic --- */
+    
     if (thread_mlfqs) {
+        /* MLFQ 모드: 큐별 타임 슬라이스 체크 및 강등 */
         struct thread *cur = thread_current();
         if (cur != idle_thread) {
+            // 1. recent_cpu 증가 (현재 스레드가 CPU를 사용했음을 기록)
             cur->recent_cpu++;
+            
+            // 2. 큐별 타임 슬라이스 한계 설정
             int slice_limit = (cur->queue_level == 0) ? TIME_SLICE_Q0
                               : (cur->queue_level == 1) ? TIME_SLICE_Q1
                               : TIME_SLICE_Q2;
 
-            /* 큐별 타임 슬라이스 체크 */
+            /* 3. 타임 슬라이스 만료 체크 및 강등 */
             if (cur->recent_cpu >= slice_limit) {
-                /* 타임 슬라이스 만료*/
+                /* 타임 슬라이스 만료 시 강등 */
                 if (cur->queue_level < 2)
                     cur->queue_level++;
                 cur->recent_cpu = 0;
-                intr_yield_on_return (); 
+                
+                // 선점 요청 (스케줄러가 다음 번에 실행되도록 설정)
+                intr_yield_on_return ();
             }
         }
+        
+        // 4. 에이징 함수 호출 (선택 사항: 적절한 주기로 호출해야 오버헤드가 적음)
+        // thread_ticks를 사용하여 주기적으로 호출하는 것이 일반적입니다.
+        if (++thread_ticks % 4 == 0) {
+            aging_ready_threads();
+        }
+
     } else {
-        /* Round-Robin 모드 (기존 로직) */
+        /* Round-Robin 모드 (기존 로직): TIME_SLICE(4틱)마다 선점 */
         if (++thread_ticks >= TIME_SLICE)
             intr_yield_on_return ();
     }
