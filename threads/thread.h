@@ -88,10 +88,14 @@ struct thread
     char name[16];             /* Name (for debugging purposes). */
     uint8_t *stack;            /* Saved stack pointer. */
     int priority;              /* Priority. */
+     /* MLFQ fields */
+    int queue_level;      /* 0 (highest) .. 2 (lowest). -1 = not initialized */
+    int ticks_in_queue;   /* ticks this thread has consumed in current queue (for demotion) */
+    int wait_ticks;       /* ticks spent waiting in ready queue (for aging) */
     struct list_elem allelem;  /* List element for all threads list. */
     int age;                   /* Aging count. */
-    int queue_level;           /* mlfqs count. */
     int age[3];
+   
 
     /* Shared between thread.c and synch.c. */
     struct list_elem elem; /* List element. */
