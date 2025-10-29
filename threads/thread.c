@@ -1,3 +1,8 @@
+/* threads/thread.c
+   MLFQ (3-level) + Aging + Preemption implementation for Pintos
+   Replace your existing threads/thread.c with this file (or merge carefully).
+*/
+
 #include "threads/thread.h"
 #include <debug.h>
 #include <stddef.h>
@@ -15,54 +20,52 @@
 #include "userprog/process.h"
 #endif
 
-/* Random value for struct thread's `magic' member.
-   Used to detect stack overflow.  See the big comment at the top
-   of thread.h for details. */
 #define THREAD_MAGIC 0xcd6abf4b
 
-/* List of processes in THREAD_READY state, that is, processes
-   that are ready to run but not actually running. */
-static struct list ready_list;
+/* Ready lists: MLFQ with 3 levels */
+#define MLFQ_LEVELS 3
+static struct list mlfq[MLFQ_LEVELS];
 
-/* List of all processes.  Processes are added to this list
-   when they are first scheduled and removed when they exit. */
+/* List of all processes. */
 static struct list all_list;
 
-/* Idle thread. */
+/* Idle thread and initial thread */
 static struct thread *idle_thread;
-
-/* Initial thread, the thread running init.c:main(). */
 static struct thread *initial_thread;
 
-/* Lock used by allocate_tid(). */
+/* Tid lock */
 static struct lock tid_lock;
 
 /* Stack frame for kernel_thread(). */
 struct kernel_thread_frame
 {
-    void *eip;             /* Return address. */
-    thread_func *function; /* Function to call. */
-    void *aux;             /* Auxiliary data for function. */
+    void *eip;
+    thread_func *function;
+    void *aux;
 };
 
 /* Statistics. */
-static long long idle_ticks;   /* # of timer ticks spent idle. */
-static long long kernel_ticks; /* # of timer ticks in kernel threads. */
-static long long user_ticks;   /* # of timer ticks in user programs. */
+static long long idle_ticks;
+static long long kernel_ticks;
+static long long user_ticks;
 
 /* Scheduling. */
-#define TIME_SLICE 4          /* # of timer ticks to give each thread. */
-static unsigned thread_ticks; /* # of timer ticks since last yield. */
+#define TIME_SLICE 4 /* not used directly for MLFQ levels, but for compatibility */
+static unsigned thread_ticks;
 
-/* MLFQ - Q0, Q1, Q2. */
-static list mlfq[3];
-/* If false (default), use round-robin scheduler.
-   If true, use multi-level feedback queue scheduler.
-   Controlled by kernel command-line option "-o mlfqs". */
+/* Time slice per MLFQ level (in ticks) */
+#define TIME_SLICE_Q0 1
+#define TIME_SLICE_Q1 2
+#define TIME_SLICE_Q2 4
+
+/* Aging threshold (ticks waiting in ready queue) */
+#define AGE_LIMIT 20
+
+/* If false, use round-robin; if true, use MLFQ */
 bool thread_mlfqs;
 
+/* Forward declarations */
 static void kernel_thread (thread_func *, void *aux);
-
 static void idle (void *aux UNUSED);
 static struct thread *running_thread (void);
 static struct thread *next_thread_to_run (void);
@@ -72,62 +75,42 @@ static void *alloc_frame (struct thread *, size_t size);
 static void schedule (void);
 void thread_schedule_tail (struct thread *prev);
 static tid_t allocate_tid (void);
-bool thread_cmp_priority(const struct list_elem *a, const struct list_elem *b, void *aux UNUSED);
-void mlfq_update(void);
-void aging_ready_threads(void);
 
-/* Initializes the threading system by transforming the code
-   that's currently running into a thread.  This can't work in
-   general and it is possible in this case only because loader.S
-   was careful to put the bottom of the stack at a page boundary.
+static void mlfq_tick(void);
+static void mlfq_aging(void);
 
-   Also initializes the run queue and the tid lock.
-
-   After calling this function, be sure to initialize the page
-   allocator before trying to create any threads with
-   thread_create().
-
-   It is not safe to call thread_current() until this function
-   finishes. */
+/* Initialize threading system. */
 void
 thread_init (void)
 {
-    ASSERT (intr_get_level () == INTR_OFF);
+    ASSERT (intr_get_level () == INTR_OFF);
 
-    lock_init (&tid_lock);
-    list_init (&ready_list);
-    list_init (&all_list);
+    lock_init (&tid_lock);
+    list_init (&all_list);
 
-    list_init(&mlfq[0]);
-    list_init(&mlfq[1]);
-    list_init(&mlfq[2]);
+    for (int i = 0; i < MLFQ_LEVELS; i++)
+        list_init (&mlfq[i]);
 
-    /* Set up a thread structure for the running thread. */
-    initial_thread = running_thread ();
-    init_thread (initial_thread, "main", PRI_DEFAULT);
-    initial_thread->status = THREAD_RUNNING;
-    initial_thread->tid = allocate_tid ();
+    /* Set up running thread structure. */
+    initial_thread = running_thread ();
+    init_thread (initial_thread, "main", PRI_DEFAULT);
+    initial_thread->status = THREAD_RUNNING;
+    initial_thread->tid = allocate_tid ();
 }
 
-/* Starts preemptive thread scheduling by enabling interrupts.
-   Also creates the idle thread. */
+/* Start threads: create idle thread, enable interrupts. */
 void
 thread_start (void)
 {
-    /* Create the idle thread. */
-    struct semaphore idle_started;
-    sema_init (&idle_started, 0);
-    thread_create ("idle", PRI_MIN, idle, &idle_started);
+    struct semaphore idle_started;
+    sema_init (&idle_started, 0);
+    thread_create ("idle", PRI_MIN, idle, &idle_started);
 
-    /* Start preemptive thread scheduling. */
-    intr_enable ();
-
-    /* Wait for the idle thread to initialize idle_thread. */
-    sema_down (&idle_started);
+    intr_enable ();
+    sema_down (&idle_started);
 }
 
-/* Called by the timer interrupt handler at each timer tick.
-   Thus, this function runs in an external interrupt context. */
+/* Timer tick handler: update stats and perform MLFQ tick+aging */
 void
 thread_tick (void)
 {
@@ -143,173 +126,125 @@ thread_tick (void)
     else
         kernel_ticks++;
 
-    /* --- MLFQ / Round-Robin Scheduling Logic --- */
-    
+    /* Common tick increment */
+    thread_ticks++;
+
+    /* If MLFQ enabled, update per-thread CPU usage / timeslice and aging */
     if (thread_mlfqs) {
-        /* MLFQ 모드: 큐별 타임 슬라이스 체크 및 강등 */
-        struct thread *cur = thread_current();
-        if (cur != idle_thread) {
-            // 1. recent_cpu 증가 (현재 스레드가 CPU를 사용했음을 기록)
-            cur->recent_cpu++;
-            
-            // 2. 큐별 타임 슬라이스 한계 설정
-            int slice_limit = (cur->queue_level == 0) ? TIME_SLICE_Q0
-                              : (cur->queue_level == 1) ? TIME_SLICE_Q1
-                              : TIME_SLICE_Q2;
-
-            /* 3. 타임 슬라이스 만료 체크 및 강등 */
-            if (cur->recent_cpu >= slice_limit) {
-                /* 타임 슬라이스 만료 시 강등 */
-                if (cur->queue_level < 2)
-                    cur->queue_level++;
-                cur->recent_cpu = 0;
-                
-                // 선점 요청 (스케줄러가 다음 번에 실행되도록 설정)
-                intr_yield_on_return ();
-            }
-        }
-        
-        // 4. 에이징 함수 호출 (선택 사항: 적절한 주기로 호출해야 오버헤드가 적음)
-        // thread_ticks를 사용하여 주기적으로 호출하는 것이 일반적입니다.
-        if (++thread_ticks % 4 == 0) {
-            aging_ready_threads();
-        }
-
+        mlfq_tick();    /* update current thread ticks_in_queue and demote if necessary */
+        mlfq_aging();   /* age waiting threads and promote if necessary */
     } else {
-        /* Round-Robin 모드 (기존 로직): TIME_SLICE(4틱)마다 선점 */
-        if (++thread_ticks >= TIME_SLICE)
+        /* Classic RR behavior */
+        if (thread_ticks >= TIME_SLICE)
             intr_yield_on_return ();
     }
 }
 
-/* Prints thread statistics. */
+/* Print stats */
 void
 thread_print_stats (void)
 {
-    printf ("Thread: %lld idle ticks, %lld kernel ticks, %lld user ticks\n",
-            idle_ticks, kernel_ticks, user_ticks);
+    printf ("Thread: %lld idle ticks, %lld kernel ticks, %lld user ticks\n",
+            idle_ticks, kernel_ticks, user_ticks);
 }
 
-/* Creates a new kernel thread named NAME with the given initial
-   PRIORITY, which executes FUNCTION passing AUX as the argument,
-   and adds it to the ready queue.  Returns the thread identifier
-   for the new thread, or TID_ERROR if creation fails.
-
-   If thread_start() has been called, then the new thread may be
-   scheduled before thread_create() returns.  It could even exit
-   before thread_create() returns.  Contrariwise, the original
-   thread may run for any amount of time before the new thread is
-   scheduled.  Use a semaphore or some other form of
-   synchronization if you need to ensure ordering.
-
-   The code provided sets the new thread's `priority' member to
-   PRIORITY, but no actual priority scheduling is implemented.
-   Priority scheduling is the goal of Problem 1-3. */
+/* Create a new kernel thread and add it to ready queue (MLFQ). */
 tid_t
 thread_create (const char *name, int priority,
-               thread_func *function, void *aux)
+               thread_func *function, void *aux)
 {
-    struct thread *t;
-    struct kernel_thread_frame *kf;
-    struct switch_entry_frame *ef;
-    struct switch_threads_frame *sf;
-    tid_t tid;
-    enum intr_level old_level;
+    struct thread *t;
+    struct kernel_thread_frame *kf;
+    struct switch_entry_frame *ef;
+    struct switch_threads_frame *sf;
+    tid_t tid;
+    enum intr_level old_level;
 
-    ASSERT (function != NULL);
+    ASSERT (function != NULL);
 
-    /* Allocate thread. */
-    t = palloc_get_page (PAL_ZERO);
-    if (t == NULL)
-        return TID_ERROR;
+    t = palloc_get_page (PAL_ZERO);
+    if (t == NULL)
+        return TID_ERROR;
 
-    /* Initialize thread. */
-    init_thread (t, name, priority);
-    tid = t->tid = allocate_tid ();
+    init_thread (t, name, priority);
+    tid = t->tid = allocate_tid ();
 
-    /* Initialize MLFQ-related fields */
-    t->queue_level = -1;
-    t->recent_cpu = 0;
-    t->age[0] = t->age[1] = t->age[2] = 0;
-   
-    //t->age = 0;
+    /* Initialize MLFQ bookkeeping */
+    t->queue_level = 0;        /* new threads start at highest queue */
+    t->ticks_in_queue = 0;
+    t->wait_ticks = 0;
 
-    /* Prepare thread for first run by initializing its stack.
-     Do this atomically so intermediate values for the 'stack' 
-     member cannot be observed. */
-    old_level = intr_disable ();
+    old_level = intr_disable ();
 
-    /* Stack frame for kernel_thread(). */
-    kf = alloc_frame (t, sizeof *kf);
-    kf->eip = NULL;
-    kf->function = function;
-    kf->aux = aux;
+    /* Prepare stack frames */
+    kf = alloc_frame (t, sizeof *kf);
+    kf->eip = NULL;
+    kf->function = function;
+    kf->aux = aux;
 
-    /* Stack frame for switch_entry(). */
-    ef = alloc_frame (t, sizeof *ef);
-    ef->eip = (void (*) (void))kernel_thread;
+    ef = alloc_frame (t, sizeof *ef);
+    ef->eip = (void (*) (void))kernel_thread;
 
-    /* Stack frame for switch_threads(). */
-    sf = alloc_frame (t, sizeof *sf);
-    sf->eip = switch_entry;
-    sf->ebp = 0;
+    sf = alloc_frame (t, sizeof *sf);
+    sf->eip = switch_entry;
+    sf->ebp = 0;
 
-    intr_set_level (old_level);
+    intr_set_level (old_level);
 
-    /* Add to run queue. */
-    thread_unblock (t);
+    /* Put thread into ready (mlfq) */
+    thread_unblock (t);
 
-    return tid;
+    return tid;
 }
 
-/* Puts the current thread to sleep.  It will not be scheduled
-   again until awoken by thread_unblock().
-
-   This function must be called with interrupts turned off.  It
-   is usually a better idea to use one of the synchronization
-   primitives in synch.h. */
+/* Block current thread (must be called with interrupts off). */
 void
 thread_block (void)
 {
-    ASSERT (!intr_context ());
-    ASSERT (intr_get_level () == INTR_OFF);
+    ASSERT (!intr_context ());
+    ASSERT (intr_get_level () == INTR_OFF);
 
-    thread_current ()->status = THREAD_BLOCKED;
-    schedule ();
+    thread_current ()->status = THREAD_BLOCKED;
+    schedule ();
 }
 
-/* Transitions a blocked thread T to the ready-to-run state.
-   This is an error if T is not blocked.  (Use thread_yield() to
-   make the running thread ready.)
-
-   This function does not preempt the running thread.  This can
-   be important: if the caller had disabled interrupts itself,
-   it may expect that it can atomically unblock a thread and
-   update other data. */
+/* Unblock thread: put into MLFQ ready queue and handle preemption. */
 void
 thread_unblock (struct thread *t)
 {
-    enum intr_level old_level;
-    ASSERT (is_thread (t));
+    enum intr_level old_level;
+    ASSERT (is_thread (t));
 
-    old_level = intr_disable ();
-    ASSERT (t->status == THREAD_BLOCKED);
-    
-    t->status = THREAD_READY;
-   
-    if (t->queue_level == -1) {
-        t->queue_level = 0;
-        t->age[0] = t->age[1] = t->age[2] = 0;
-    }
+    old_level = intr_disable ();
+    ASSERT (t->status == THREAD_BLOCKED);
 
-    list_push_back(&mlfq[t->queue_level], &t->elem);
+    t->status = THREAD_READY;
 
-    if (thread_mlfqs) {
-        /* MLFQ 모드: 현재 스레드보다 높은 우선순위(낮은 큐 레벨)의 스레드가 준비되면 선점 */
-        if (t->queue_level < thread_current()->queue_level && intr_context() == false)
-            thread_yield();
-    } 
-    // ... (기존 priority 선점 로직은 MLFQ 모드에서는 비활성화하거나 수정 필요) ...
+    /* If queue_level uninitialized, initialize to 0 */
+    if (t->queue_level < 0)
+        t->queue_level = 0;
+
+    /* reset wait_ticks for aging */
+    t->wait_ticks = 0;
+    t->ticks_in_queue = 0;
+
+    /* push to corresponding MLFQ level back (FIFO) */
+    list_push_back (&mlfq[t->queue_level], &t->elem);
+
+    /* Preemption: if unblocked thread is at higher-priority queue than current, request preempt.
+       If we're in interrupt context, use intr_yield_on_return; otherwise, call thread_yield (which expects interrupts off). */
+    struct thread *cur = thread_current ();
+    if (t != idle_thread && cur != idle_thread) {
+        if (t->queue_level < cur->queue_level) {
+            if (intr_context ())
+                intr_yield_on_return ();
+            else {
+                /* We are allowed to yield now (interrupts off) */
+                /* Note: thread_yield will call schedule(), so interrupts must be off. */
+                thread_yield ();
+            }
+        }
+    }
 
     intr_set_level (old_level);
 }
@@ -318,453 +253,327 @@ thread_unblock (struct thread *t)
 const char *
 thread_name (void)
 {
-    return thread_current ()->name;
-}
-
-/* Returns the running thread.
-   This is running_thread() plus a couple of sanity checks.
-   See the big comment at the top of thread.h for details. */
-struct thread *
-thread_current (void)
-{
-    struct thread *t = running_thread ();
-
-    /* Make sure T is really a thread.
-     If either of these assertions fire, then your thread may
-     have overflowed its stack.  Each thread has less than 4 kB
-     of stack, so a few big automatic arrays or moderate
-     recursion can cause stack overflow. */
-    ASSERT (is_thread (t));
-    ASSERT (t->status == THREAD_RUNNING);
-
-    return t;
-}
-
-/* Returns the running thread's tid. */
-tid_t
-thread_tid (void)
-{
-    return thread_current ()->tid;
-}
-
-/* Deschedules the current thread and destroys it.  Never
-   returns to the caller. */
-void
-thread_exit (void)
-{
-    ASSERT (!intr_context ());
-
-#ifdef USERPROG
-    process_exit ();
-#endif
-
-    /* Remove thread from all threads list, set our status to dying,
-     and schedule another process.  That process will destroy us
-     when it calls thread_schedule_tail(). */
-    intr_disable ();
-    list_remove (&thread_current ()->allelem);
-    thread_current ()->status = THREAD_DYING;
-    schedule ();
-    NOT_REACHED ();
-}
-
-/* Yields the CPU.  The current thread is not put to sleep and
-   may be scheduled again immediately at the scheduler's whim. */
-void
-thread_yield (void)
-{
-    struct thread *cur = thread_current ();
-    enum intr_level old_level;
-
-    ASSERT (!intr_context ());
-
-    old_level = intr_disable ();
-    if (cur != idle_thread) {
-        if (cur->queue_level == -1)
-            cur->queue_level = 0;
-        list_push_back (&mlfq[cur->queue_level], &cur->elem);
-    }
-        
-    cur->status = THREAD_READY;
-    schedule ();
-    intr_set_level (old_level);
-}
-
-/* Invoke function 'func' on all threads, passing along 'aux'.
-   This function must be called with interrupts off. */
-void
-thread_foreach (thread_action_func *func, void *aux)
-{
-    struct list_elem *e;
-
-    ASSERT (intr_get_level () == INTR_OFF);
-
-    for (e = list_begin (&all_list); e != list_end (&all_list);
-         e = list_next (e))
-        {
-            struct thread *t = list_entry (e, struct thread, allelem);
-            func (t, aux);
-        }
-}
-
-/* Sets the current thread's priority to NEW_PRIORITY. */
-void
-thread_set_priority(int new_priority) {
-    int old_priority = thread_current()->priority;
-    thread_current()->priority = new_priority;
-
-    if (new_priority < old_priority)
-        thread_yield();
-}
-
-/* Returns the current thread's priority. */
-int
-thread_get_priority (void)
-{
-    return thread_current ()->priority;
-}
-
-/* Sets the current thread's nice value to NICE. */
-void
-thread_set_nice (int nice UNUSED)
-{
-    /* Not yet implemented. */
-}
-
-/* Returns the current thread's nice value. */
-int
-thread_get_nice (void)
-{
-    /* Not yet implemented. */
-    return 0;
-}
-
-/* Returns 100 times the system load average. */
-int
-thread_get_load_avg (void)
-{
-    /* Not yet implemented. */
-    return 0;
-}
-
-/* Returns 100 times the current thread's recent_cpu value. */
-int
-thread_get_recent_cpu (void)
-{
-    /* Not yet implemented. */
-    return 0;
-}
-
-/* Idle thread.  Executes when no other thread is ready to run.
-
-   The idle thread is initially put on the ready list by
-   thread_start().  It will be scheduled once initially, at which
-   point it initializes idle_thread, "up"s the semaphore passed
-   to it to enable thread_start() to continue, and immediately
-   blocks.  After that, the idle thread never appears in the
-   ready list.  It is returned by next_thread_to_run() as a
-   special case when the ready list is empty. */
-static void
-idle (void *idle_started_ UNUSED)
-{
-    struct semaphore *idle_started = idle_started_;
-    idle_thread = thread_current ();
-    sema_up (idle_started);
-
-    for (;;)
-        {
-            /* Let someone else run. */
-            intr_disable ();
-            thread_block ();
-
-            /* Re-enable interrupts and wait for the next one.
-
-         The `sti' instruction disables interrupts until the
-         completion of the next instruction, so these two
-         instructions are executed atomically.  This atomicity is
-         important; otherwise, an interrupt could be handled
-         between re-enabling interrupts and waiting for the next
-         one to occur, wasting as much as one clock tick worth of
-         time.
-
-         See [IA32-v2a] "HLT", [IA32-v2b] "STI", and [IA32-v3a]
-         7.11.1 "HLT Instruction". */
-            asm volatile ("sti; hlt" : : : "memory");
-        }
-}
-
-/* Function used as the basis for a kernel thread. */
-static void
-kernel_thread (thread_func *function, void *aux)
-{
-    ASSERT (function != NULL);
-
-    intr_enable (); /* The scheduler runs with interrupts off. */
-    function (aux); /* Execute the thread function. */
-    thread_exit (); /* If function() returns, kill the thread. */
+    return thread_current ()->name;
 }
 
 /* Returns the running thread. */
 struct thread *
-running_thread (void)
+thread_current (void)
 {
-    uint32_t *esp;
+    struct thread *t = running_thread ();
 
-    /* Copy the CPU's stack pointer into `esp', and then round that
-     down to the start of a page.  Because `struct thread' is
-     always at the beginning of a page and the stack pointer is
-     somewhere in the middle, this locates the curent thread. */
-    asm ("mov %%esp, %0" : "=g"(esp));
-    return pg_round_down (esp);
+    ASSERT (is_thread (t));
+    ASSERT (t->status == THREAD_RUNNING);
+
+    return t;
 }
 
-/* Returns true if T appears to point to a valid thread. */
+/* Returns current tid. */
+tid_t
+thread_tid (void)
+{
+    return thread_current ()->tid;
+}
+
+/* Exit current thread. */
+void
+thread_exit (void)
+{
+    ASSERT (!intr_context ());
+
+#ifdef USERPROG
+    process_exit ();
+#endif
+
+    intr_disable ();
+    list_remove (&thread_current ()->allelem);
+    thread_current ()->status = THREAD_DYING;
+    schedule ();
+    NOT_REACHED ();
+}
+
+/* Yield CPU voluntarily: put current thread at end of its MLFQ queue. */
+void
+thread_yield (void)
+{
+    struct thread *cur = thread_current ();
+    enum intr_level old_level;
+
+    ASSERT (!intr_context ());
+
+    old_level = intr_disable ();
+
+    if (cur != idle_thread) {
+        /* Put current thread to back of its current queue */
+        if (cur->queue_level < 0)
+            cur->queue_level = 0;
+        cur->ticks_in_queue = 0; /* reset CPU consumption in this queue (will be counted when re-scheduled) */
+        list_push_back (&mlfq[cur->queue_level], &cur->elem);
+    }
+
+    cur->status = THREAD_READY;
+    schedule ();
+    intr_set_level (old_level);
+}
+
+/* Apply function to all threads (interrupts off). */
+void
+thread_foreach (thread_action_func *func, void *aux)
+{
+    struct list_elem *e;
+
+    ASSERT (intr_get_level () == INTR_OFF);
+
+    for (e = list_begin (&all_list); e != list_end (&all_list);
+         e = list_next (e))
+    {
+        struct thread *t = list_entry (e, struct thread, allelem);
+        func (t, aux);
+    }
+}
+
+/* Set current thread's priority. For MLFQ we primarily use queue levels, but keep API. */
+void
+thread_set_priority (int new_priority)
+{
+    int old_priority = thread_current ()->priority;
+    thread_current ()->priority = new_priority;
+
+    /* Priority change might affect scheduling only in non-MLFQ case or if user uses priority field.
+       For safety, if effective priority decreased, yield to allow other threads to run. */
+    if (new_priority < old_priority)
+        thread_yield ();
+}
+
+/* Get priority */
+int
+thread_get_priority (void)
+{
+    return thread_current ()->priority;
+}
+
+/* Not implemented nice/load_avg in this MLFQ simplified implementation */
+void
+thread_set_nice (int nice UNUSED) { }
+int thread_get_nice (void) { return 0; }
+int thread_get_load_avg (void) { return 0; }
+int thread_get_recent_cpu (void) { return 0; }
+
+/* Idle thread. */
+static void
+idle (void *idle_started_ UNUSED)
+{
+    struct semaphore *idle_started = idle_started_;
+    idle_thread = thread_current ();
+    sema_up (idle_started);
+
+    for (;;)
+    {
+        intr_disable ();
+        thread_block ();
+
+        asm volatile ("sti; hlt" : : : "memory");
+    }
+}
+
+/* Kernel thread wrapper. */
+static void
+kernel_thread (thread_func *function, void *aux)
+{
+    ASSERT (function != NULL);
+
+    intr_enable ();
+    function (aux);
+    thread_exit ();
+}
+
+/* Get running_thread using stack pointer. */
+struct thread *
+running_thread (void)
+{
+    uint32_t *esp;
+    asm ("mov %%esp, %0" : "=g"(esp));
+    return pg_round_down (esp);
+}
+
+/* Verify thread pointer. */
 static bool
 is_thread (struct thread *t)
 {
-    return t != NULL && t->magic == THREAD_MAGIC;
+    return t != NULL && t->magic == THREAD_MAGIC;
 }
 
-/* Does basic initialization of T as a blocked thread named
-   NAME. */
+/* Initialize thread structure. */
 static void
 init_thread (struct thread *t, const char *name, int priority)
 {
-    ASSERT (t != NULL);
-    ASSERT (PRI_MIN <= priority && priority <= PRI_MAX);
-    ASSERT (name != NULL);
+    ASSERT (t != NULL);
+    ASSERT (PRI_MIN <= priority && priority <= PRI_MAX);
+    ASSERT (name != NULL);
 
-    memset (t, 0, sizeof *t);
-    t->status = THREAD_BLOCKED;
-    strlcpy (t->name, name, sizeof t->name);
-    t->stack = (uint8_t *)t + PGSIZE;
-    t->priority = priority;
-    t->magic = THREAD_MAGIC;
+    memset (t, 0, sizeof *t);
+    t->status = THREAD_BLOCKED;
+    strlcpy (t->name, name, sizeof t->name);
+    t->stack = (uint8_t *) t + PGSIZE;
+    t->priority = priority;
+    t->magic = THREAD_MAGIC;
 
-    /* MLFQ / bookkeeping defaults */
-    t->queue_level = -1;
-    t->recent_cpu = 0;
-    t->age[0] = t->age[1] = t->age[2] = 0;
-   
-    list_push_back (&all_list, &t->allelem);
+    /* MLFQ bookkeeping defaults */
+    t->queue_level = 0;
+    t->ticks_in_queue = 0;
+    t->wait_ticks = 0;
+
+    list_push_back (&all_list, &t->allelem);
 }
 
-/* Allocates a SIZE-byte frame at the top of thread T's stack and
-   returns a pointer to the frame's base. */
+/* Alloc stack frame. */
 static void *
 alloc_frame (struct thread *t, size_t size)
 {
-    /* Stack data is always allocated in word-size units. */
-    ASSERT (is_thread (t));
-    ASSERT (size % sizeof (uint32_t) == 0);
+    ASSERT (is_thread (t));
+    ASSERT (size % sizeof (uint32_t) == 0);
 
-    t->stack -= size;
-    return t->stack;
+    t->stack -= size;
+    return t->stack;
 }
 
-/* Chooses and returns the next thread to be scheduled.  Should
-   return a thread from the run queue, unless the run queue is
-   empty.  (If the running thread can continue running, then it
-   will be in the run queue.)  If the run queue is empty, return
-   idle_thread. */
+/* Choose next thread to run from highest-priority non-empty queue. */
 static struct thread *
 next_thread_to_run (void)
 {
-    /*if (list_empty (&ready_list))
-        return idle_thread;
-    else
-        return list_entry (list_pop_front (&ready_list), struct thread, elem);*/
-  for (int i = 0; i < 3; i++) {
-        if (!list_empty (&mlfq[i])) {
-            return list_entry (list_pop_front (&mlfq[i]), struct thread, elem);
-        }
-    }
-    return idle_thread;
+    for (int i = 0; i < MLFQ_LEVELS; i++) {
+        if (!list_empty (&mlfq[i])) {
+            struct list_elem *e = list_pop_front (&mlfq[i]);
+            struct thread *t = list_entry (e, struct thread, elem);
+            return t;
+        }
+    }
+    return idle_thread;
 }
 
-/* Completes a thread switch by activating the new thread's page
-   tables, and, if the previous thread is dying, destroying it.
-
-   At this function's invocation, we just switched from thread
-   PREV, the new thread is already running, and interrupts are
-   still disabled.  This function is normally invoked by
-   thread_schedule() as its final action before returning, but
-   the first time a thread is scheduled it is called by
-   switch_entry() (see switch.S).
-
-   It's not safe to call printf() until the thread switch is
-   complete.  In practice that means that printf()s should be
-   added at the end of the function.
-
-   After this function and its caller returns, the thread switch
-   is complete. */
+/* Complete context switch, finish bookkeeping. */
 void
 thread_schedule_tail (struct thread *prev)
 {
-    struct thread *cur = running_thread ();
+    struct thread *cur = running_thread ();
 
-    ASSERT (intr_get_level () == INTR_OFF);
+    ASSERT (intr_get_level () == INTR_OFF);
 
-    /* Mark us as running. */
-    cur->status = THREAD_RUNNING;
+    cur->status = THREAD_RUNNING;
 
-    /* Start new time slice. */
-    thread_ticks = 0;
+    /* Start new time slice counter */
+    thread_ticks = 0;
 
 #ifdef USERPROG
-    /* Activate the new address space. */
-    process_activate ();
+    process_activate ();
 #endif
 
-    /* If the thread we switched from is dying, destroy its struct
-     thread.  This must happen late so that thread_exit() doesn't
-     pull out the rug under itself.  (We don't free
-     initial_thread because its memory was not obtained via
-     palloc().) */
-    if (prev != NULL && prev->status == THREAD_DYING && prev != initial_thread)
-        {
-            ASSERT (prev != cur);
-            palloc_free_page (prev);
-        }
+    if (prev != NULL && prev->status == THREAD_DYING && prev != initial_thread) {
+        ASSERT (prev != cur);
+        palloc_free_page (prev);
+    }
 }
 
-/* Schedules a new process.  At entry, interrupts must be off and
-   the running process's state must have been changed from
-   running to some other state.  This function finds another
-   thread to run and switches to it.
-
-   It's not safe to call printf() until thread_schedule_tail()
-   has completed. */
+/* Core scheduler: pick next and switch. */
 static void
 schedule (void)
 {
-    struct thread *cur = running_thread ();
-    struct thread *next = next_thread_to_run ();
-    struct thread *prev = NULL;
+    struct thread *cur = running_thread ();
+    struct thread *next = next_thread_to_run ();
+    struct thread *prev = NULL;
 
-    ASSERT (intr_get_level () == INTR_OFF);
-    ASSERT (cur->status != THREAD_RUNNING);
-    ASSERT (is_thread (next));
+    ASSERT (intr_get_level () == INTR_OFF);
+    ASSERT (cur->status != THREAD_RUNNING);
+    ASSERT (is_thread (next));
 
-    if (cur != next)
-        prev = switch_threads (cur, next);
-    thread_schedule_tail (prev);
+    if (cur != next)
+        prev = switch_threads (cur, next);
+    thread_schedule_tail (prev);
 }
 
-/* Returns a tid to use for a new thread. */
+/* Allocate tid. */
 static tid_t
 allocate_tid (void)
 {
-    static tid_t next_tid = 1;
-    tid_t tid;
+    static tid_t next_tid = 1;
+    tid_t tid;
 
-    lock_acquire (&tid_lock);
-    tid = next_tid++;
-    lock_release (&tid_lock);
+    lock_acquire (&tid_lock);
+    tid = next_tid++;
+    lock_release (&tid_lock);
 
-    return tid;
+    return tid;
 }
 
-/* Offset of `stack' member within `struct thread'.
-   Used by switch.S, which can't figure it out on its own. */
-uint32_t thread_stack_ofs = offsetof (struct thread, stack);
-
-bool
-thread_cmp_priority(const struct list_elem *a, const struct list_elem *b, void *aux UNUSED)
+/* MLFQ helper: update current running thread's ticks and demote if needed. */
+static void
+mlfq_tick(void)
 {
-   struct thread *t_a = list_entry(a, struct thread, elem);
-   struct thread *t_b = list_entry(b, struct thread, elem);
-   return t_a->priority > t_b->priority;
-}
-
-void
-aging_ready_threads(void)
-{
-    // MLFQ가 아닌 경우 아무것도 하지 않음
-    if (!thread_mlfqs)
+    struct thread *cur = thread_current ();
+    if (cur == idle_thread)
         return;
 
-    for (int i = 0; i < 3; i++) {
-        struct list_elem *e = list_begin (&mlfq[i]);
-        while (e != list_end (&mlfq[i])) {
-            struct list_elem *next = list_next(e);
+    /* Ensure queue_level is valid */
+    if (cur->queue_level < 0)
+        cur->queue_level = 0;
+
+    cur->ticks_in_queue++;
+
+    int slice_limit = (cur->queue_level == 0) ? TIME_SLICE_Q0
+                      : (cur->queue_level == 1) ? TIME_SLICE_Q1
+                      : TIME_SLICE_Q2;
+
+    if (cur->ticks_in_queue >= slice_limit) {
+        /* Demote if possible */
+        if (cur->queue_level < MLFQ_LEVELS - 1)
+            cur->queue_level++;
+        cur->ticks_in_queue = 0;
+
+        /* Voluntary yield to let scheduler pick next thread */
+        /* If interrupts on, use intr_yield_on_return to schedule on return from interrupt */
+        if (intr_context ())
+            intr_yield_on_return ();
+        else
+            thread_yield ();
+    }
+}
+
+/* MLFQ aging: increment wait_ticks for threads in ready queues and promote if aged. */
+static void
+mlfq_aging(void)
+{
+    enum intr_level old_level = intr_disable ();
+
+    for (int level = 1; level < MLFQ_LEVELS; level++) {
+        struct list_elem *e = list_begin (&mlfq[level]);
+        while (e != list_end (&mlfq[level])) {
+            struct list_elem *next = list_next (e);
             struct thread *t = list_entry (e, struct thread, elem);
 
-            /* 현재 큐 레벨의 에이징 값만 증가 */
-            // t->age[i]++; 
-            // (만약 t->age를 단일 int로 바꿨다면 t->age++;)
-
-            // 배열 구조를 유지한다고 가정하고, 현재 큐 레벨에 맞는 age만 증가시킨다고 가정
-            t->age[i]++; 
-
-            if (t->age[i] >= AGE_LIMIT && t->queue_level > 0) {
-                // 승격
+            t->wait_ticks++;
+            if (t->wait_ticks >= AGE_LIMIT) {
+                /* promote to higher priority queue (lower level number) */
                 list_remove (&t->elem);
-                t->queue_level--;
-                
-                // 승격 시 모든 에이징 값 리셋
-                t->age[0] = t->age[1] = t->age[2] = 0; 
-                
-                // 새로운 큐에 삽입
+                if (t->queue_level > 0)
+                    t->queue_level--;
+                t->wait_ticks = 0;
+                t->ticks_in_queue = 0;
                 list_push_back (&mlfq[t->queue_level], &t->elem);
-            }
 
+                /* If the promoted thread is now higher priority than current, request preempt */
+                struct thread *cur = thread_current ();
+                if (t != idle_thread && cur != idle_thread && t->queue_level < cur->queue_level) {
+                    if (intr_context ())
+                        intr_yield_on_return ();
+                    else
+                        thread_yield ();
+                }
+
+                /* after removal, continue iteration from next (we already set next) */
+            }
             e = next;
         }
     }
 
-    /* 에이징에 의한 선점 체크 */
-    struct thread *cur = thread_current ();
-    for (int i = 0; i < 3; i++) {
-        if (!list_empty (&mlfq[i])) {
-            // 가장 높은 우선순위(i=0) 큐의 맨 앞에 있는 스레드
-            struct thread *front = list_entry (list_front (&mlfq[i]), struct thread, elem);
-            if (front->queue_level < cur->queue_level)
-                thread_yield ();
-            break;
-        }
-    }
+    intr_set_level (old_level);
 }
-
-#define TIME_SLICE_Q0 2
-#define TIME_SLICE_Q1 4
-#define TIME_SLICE_Q2 8
-#define AGE_LIMIT 20
-
-void
-mlfq_update(void)
-{
-    struct thread *cur = thread_current();
-    if (cur != idle_thread) {
-        cur->recent_cpu++;
-        int slice_limit = (cur->queue_level == 0) ? TIME_SLICE_Q0
-                         : (cur->queue_level == 1) ? TIME_SLICE_Q1
-                         : TIME_SLICE_Q2;
-
-        if (cur->recent_cpu >= slice_limit) {
-            if (cur->queue_level < 2)
-                cur->queue_level++;
-            cur->recent_cpu = 0;
-            thread_yield ();
-            return;
-        }
-    }
-    for (int i = 0; i < 3; i++) {
-        struct list_elem *e = list_begin (&mlfq[i]);
-        while (e != list_end (&mlfq[i])) {
-            struct list_elem *next = list_next (e);
-            struct thread *t = list_entry (e, struct thread, elem);
-
-            t->age[i]++;
-
-            if (t->age[i] >= AGE_LIMIT && t->queue_level > 0) {
-                list_remove (&t->elem);
-                t->queue_level--;
-                t->age[0] = t->age[1] = t->age[2] = 0;
-                list_push_back (&mlfq[t->queue_level], &t->elem);
-            }
-
-            e = next;
-        }
-    }
-} 여기서 선점형 우선순위, 에이징, mlfq 구현이 완벽한지 봐줘
