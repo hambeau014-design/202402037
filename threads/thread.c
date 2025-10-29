@@ -666,21 +666,22 @@ thread_cmp_priority(const struct list_elem *a, const struct list_elem *b, void *
 void
 aging_ready_threads(void)
 {
+    /*MLFQ가 아닌 경우 아무것도 하지 않음*/
+    if (!thread_mlfqs)
+        return;
+
     for (int i = 0; i < 3; i++) {
         struct list_elem *e = list_begin (&mlfq[i]);
         while (e != list_end (&mlfq[i])) {
             struct list_elem *next = list_next(e);
             struct thread *t = list_entry (e, struct thread, elem);
-
-            /* 각 스레드는 자신이 현재 머물러있는 큐 레벨에서만 에이징을 증가시킴 */
-            if (t->queue_level == i)
-                t->age[i]++;
+            t->age[i]++; 
 
             if (t->age[i] >= AGE_LIMIT && t->queue_level > 0) {
-                /* 상위 큐로 승격 (queue_level--). list_remove는 e를 무효화하므로 next를 미리 저장 */
                 list_remove (&t->elem);
                 t->queue_level--;
-                t->age[0] = t->age[1] = t->age[2] = 0; /* 승격 뒤 에이징 리셋 */
+                t->age[0] = t->age[1] = t->age[2] = 0; 
+                
                 list_push_back (&mlfq[t->queue_level], &t->elem);
             }
 
@@ -688,7 +689,7 @@ aging_ready_threads(void)
         }
     }
 
-    /* 현재 실행중인 스레드와 새로 front에 있는 스레드 비교하여 필요시 선점 */
+    /* 에이징에 의한 선점 체크 */
     struct thread *cur = thread_current ();
     for (int i = 0; i < 3; i++) {
         if (!list_empty (&mlfq[i])) {
@@ -699,8 +700,6 @@ aging_ready_threads(void)
         }
     }
 }
-
-/*열심히 구현했건만....*/
 
 #define TIME_SLICE_Q0 2
 #define TIME_SLICE_Q1 4
