@@ -294,9 +294,10 @@ thread_unblock (struct thread *t)
 
     list_push_back(&mlfq[t->queue_level], &t->elem);
 
-    if (t->priority > thread_current()->priority && intr_context() == false)
-        thread_yield();
-
+    if (thread_mlfqs) {
+        if (t->queue_level < thread_current()->queue_level && intr_context() == false)
+            thread_yield();
+    }
     intr_set_level (old_level);
 }
 
