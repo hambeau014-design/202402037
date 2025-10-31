@@ -83,30 +83,35 @@ typedef int tid_t;
 struct thread
 {
     /* Owned by thread.c. */
-    tid_t tid;                 /* Thread identifier. */
+    tid_t tid;              /* Thread identifier. */
     enum thread_status status; /* Thread state. */
-    char name[16];             /* Name (for debugging purposes). */
-    uint8_t *stack;            /* Saved stack pointer. */
-    int priority;              /* Priority. */
-     /* MLFQ fields */
-    int queue_level;      /* 0 (highest) .. 2 (lowest). -1 = not initialized */
-    int ticks_in_queue;   /* ticks this thread has consumed in current queue (for demotion) */
-    int wait_ticks;       /* ticks spent waiting in ready queue (for aging) */
-    struct list_elem allelem;  /* List element for all threads list. */
-    int age;                   /* Aging count. */
-    int age[3];
-   
+    char name[16];           /* Name (for debugging purposes). */
+    uint8_t *stack;         /* Saved stack pointer. */
+    
+    // [핵심] Priority Scheduling 및 Donation 관련 필드
+    int priority;           /* Current effective priority (may be donated). */
+    int original_priority;  /* Base priority set by user/nice value. */
+    struct lock *wait_on_lock; /* Lock the thread is currently waiting on. */
+    struct list holding_locks; /* List of locks the thread holds. */
+    
+    // [MLFQS Fields]
+    int nice;               /* Nice value (-20 to 20). */
+    int recent_cpu;         /* Recent CPU usage (fixed-point arithmetic). */
+    int age;                /* Generic aging or other scheduling counter. */
+    // int queue_level;      /* MLFQS Level (if using explicit queues) */
+    
+    struct list_elem allelem; /* List element for all threads list. */
 
     /* Shared between thread.c and synch.c. */
-    struct list_elem elem; /* List element. */
+    struct list_elem elem;  /* List element for ready/wait lists. */
 
 #ifdef USERPROG
     /* Owned by userprog/process.c. */
-    uint32_t *pagedir; /* Page directory. */
+    uint32_t *pagedir;      /* Page directory. */
 #endif
 
     /* Owned by thread.c. */
-    unsigned magic; /* Detects stack overflow. */
+    unsigned magic;         /* Detects stack overflow. */
 };
 
 /* If false (default), use round-robin scheduler.
