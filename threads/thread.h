@@ -90,13 +90,19 @@ struct thread
     struct list_elem allelem;  /* List element for all threads list. */
 
     /* Shared between thread.c and synch.c. */
-    struct list_elem elem; /* List element. */
+    struct list_elem elem;     /* List element. */
     
     // ===================================================================
-    // *** MODIFICATION: Aging 및 MLFQS 멤버 추가 ***
+    // *** MODIFICATION: Aging, MLFQS, Priority Donation 멤버 추가 ***
     int age;                   /* Age for aging and priority promotion (ticks waiting). */
     enum mlfqs_queue mlfqs_queue_level; /* Current MLFQS queue level. */
     int mlfqs_ticks;           /* Ticks used in the current time slice. */
+    
+    // Priority Donation
+    int original_priority;     /* Thread's priority without donation. */
+    struct lock *wait_on_lock; /* Lock thread is waiting for (NULL if none). */
+    struct list_elem donation_elem; /* Element for the list of threads donating priority. */
+    struct list donations;     /* List of donation_elem from threads waiting on its lock. */
     // ===================================================================
     
 #ifdef USERPROG
@@ -144,8 +150,13 @@ typedef void thread_action_func (struct thread *t, void *aux);
 void thread_foreach (thread_action_func *, void *);
 
 // ===================================================================
-// *** MODIFICATION: 우선순위 비교 함수 선언 ***
+// *** MODIFICATION: 우선순위 비교 함수 및 기부 관련 함수 선언 ***
 bool priority_less (const struct list_elem *a, const struct list_elem *b, void *aux);
+void thread_update_priority (struct thread *t);
+void thread_donate_priority (void);
+void thread_remove_donation (struct lock *lock);
+void thread_set_priority (int new_priority);
+int thread_get_priority (void);
 // ===================================================================
 
 #endif /* threads/thread.h */
