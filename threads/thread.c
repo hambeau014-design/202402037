@@ -81,7 +81,8 @@ static void *alloc_frame (struct thread *, size_t size);
 static void schedule (void);
 void thread_schedule_tail (struct thread *prev);
 static tid_t allocate_tid (void);
-
+static struct list *mlfqs_get_queue(enum mlfqs_queue level);
+bool priority_less (const struct list_elem *a, const struct list_elem *b, void *aux UNUSED);
 // ===================================================================
 // *** MODIFICATION: 헬퍼 함수 구현 ***
 
