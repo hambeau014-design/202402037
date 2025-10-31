@@ -1,4 +1,32 @@
-/* This file is derived from source code for the Nachos (중략) */
+/* synch.c */
+
+/* This file is derived from source code for the Nachos
+   instructional operating system.  The Nachos copyright notice
+   is reproduced in full below. */
+
+/* Copyright (c) 1992-1996 The Regents of the University of California.
+   All rights reserved.
+
+   Permission to use, copy, modify, and distribute this software
+   and its documentation for any purpose, without fee, and
+   without written agreement is hereby granted, provided that the
+   above copyright notice and the following two paragraphs appear
+   in all copies of this software.
+
+   IN NO EVENT SHALL THE UNIVERSITY OF CALIFORNIA BE LIABLE TO
+   ANY PARTY FOR DIRECT, INDIRECT, SPECIAL, INCIDENTAL, OR
+   CONSEQUENTIAL DAMAGES ARISING OUT OF THE USE OF THIS SOFTWARE
+   AND ITS DOCUMENTATION, EVEN IF THE UNIVERSITY OF CALIFORNIA
+   HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+   THE UNIVERSITY OF CALIFORNIA SPECIFICALLY DISCLAIMS ANY
+   WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+   WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+   PURPOSE.  THE SOFTWARE PROVIDED HEREUNDER IS ON AN "AS IS"
+   BASIS, AND THE UNIVERSITY OF CALIFORNIA HAS NO OBLIGATION TO
+   PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR
+   MODIFICATIONS.
+*/
 
 #include "threads/synch.h"
 #include <stdio.h>
@@ -6,146 +34,116 @@
 #include "threads/interrupt.h"
 #include "threads/thread.h"
 
-/* Initializes semaphore SEMA to VALUE. (중략) */
+/* Initializes semaphore SEMA to VALUE.  A semaphore is a
+   nonnegative integer along with two atomic operators for
+   manipulating it:
+   - down or P() decrements the value, blocking if the value is
+     already zero.
+   - up or V() increments the value, and wakes up one thread
+     waiting in down if any exist. */
+void
+sema_init (struct semaphore *sema, unsigned value)
+{
+    ASSERT (sema != NULL);
+    sema->value = value;
+    list_init (&sema->waiters);
+}
 
-/* Down or "P" operation on a semaphore. */
+/* Down or "P" operation, also known as "wait".
+
+   Attempts to decrement the semaphore's value.  If the value
+   is 0, waits until it is greater than 0.  This operation is
+   atomic, so the check and decrement act as a single unit.
+   When the semaphore is successfully decremented, the thread
+   proceeds. */
 void
 sema_down (struct semaphore *sema)
 {
+    struct thread *cur = thread_current ();
     enum intr_level old_level;
 
     ASSERT (sema != NULL);
     ASSERT (!intr_context ());
 
     old_level = intr_disable ();
-    while (sema->value == 0)
+    if (sema->value > 0) 
+        sema->value--;
+    else 
         {
-            // 🚨 [수정] list_push_back 대신 우선순위 순으로 삽입 (Priority Scheduling 필수)
-            list_insert_ordered (&sema->waiters, &thread_current ()->elem, thread_cmp_priority, NULL);
+            cur->status = THREAD_BLOCKED;
+            
+            // ===================================================================
+            // *** MODIFICATION: list_insert_ordered를 사용하여 우선순위 순으로 삽입 ***
+            list_insert_ordered (&sema->waiters, &cur->elem, priority_less, NULL);
+            // ===================================================================
+            
             thread_block ();
         }
-    sema->value--;
     intr_set_level (old_level);
 }
 
-/* Tries to acquire a semaphore via a "down" operation. (중략) */
+/* Tries to decrement the semaphore's value, without blocking.  If
+   the value is 0, returns false.  Otherwise, returns true and
+   decrements the value.
 
-/* Up or "V" operation on a semaphore. */
+   This operation is atomic, so the check and decrement act as a
+   single unit. */
+bool
+sema_try_down (struct semaphore *sema)
+{
+    enum intr_level old_level;
+    bool success;
+
+    ASSERT (sema != NULL);
+
+    old_level = intr_disable ();
+    if (sema->value > 0) 
+        {
+            sema->value--;
+            success = true;
+        }
+    else
+        success = false;
+    intr_set_level (old_level);
+
+    return success;
+}
+
+/* Up or "V" operation, also known as "signal".
+
+   Increments the semaphore's value and wakes up one thread
+   waiting in down, if any exist.  This operation is atomic, so
+   the increment and wake-up act as a single unit. */
 void
 sema_up (struct semaphore *sema)
 {
     enum intr_level old_level;
 
     ASSERT (sema != NULL);
-
     old_level = intr_disable ();
-    if (!list_empty (&sema->waiters))
-        // sema_down에서 우선순위 순으로 삽입했으므로, list_pop_front가 가장 높은 우선순위 스레드를 꺼냄
-        thread_unblock (list_entry (list_pop_front (&sema->waiters),
-                                    struct thread, elem));
+    if (!list_empty (&sema->waiters)) 
+        {
+            // list_pop_front는 정렬된 리스트에서 최고 우선순위 스레드를 꺼낸다.
+            struct thread *t = list_entry (list_pop_front (&sema->waiters), struct thread, elem);
+            thread_unblock (t); // thread_unblock에서 선점 체크를 수행한다.
+        }
     sema->value++;
     intr_set_level (old_level);
 }
 
-/* Initializes lock LOCK. */
-void
-lock_init (struct lock *lock)
-{
-    ASSERT (lock != NULL);
+/* ... (나머지 기존 함수: sema_self_test, lock_init, lock_acquire, lock_try_acquire, lock_release, lock_held_by_current_thread, cond_init) ... */
 
-    lock->holder = NULL;
-    sema_init (&lock->semaphore, 1);
-    // 🚨 [추가] Donation 필드 초기화
-    lock->max_priority = PRI_MIN;
-    list_init (&lock->elem); 
-}
+/* Waits on condition variable COND, which must be protected by
+   LOCK. The current thread is blocked until another thread calls
+   cond_signal() or cond_broadcast() on the same condition
+   variable.
 
-/* Acquires LOCK, sleeping until it becomes available if
-   necessary. */
-void
-lock_acquire (struct lock *lock)
-{
-    enum intr_level old_level;
-    struct thread *cur = thread_current();
-
-    ASSERT (lock != NULL);
-    ASSERT (!intr_context ());
-    ASSERT (!lock_held_by_current_thread (lock));
-
-    old_level = intr_disable();
-
-    // 1. Priority Donation: 락 보유자에게 우선순위 기부
-    if (lock->holder != NULL) {
-        // 현재 스레드가 대기해야 하므로, 락과 락 보유자에게 자신의 우선순위를 기부
-        cur->wait_on_lock = lock;
-        if (cur->priority > lock->max_priority) {
-            lock->max_priority = cur->priority;
-        }
-        // 연쇄 기부 로직은 thread_donate_priority 내부에서 처리
-        thread_donate_priority(lock->holder, cur->priority);
-    }
-
-    // 2. 세마포어 다운 (블록)
-    sema_down (&lock->semaphore);
-
-    // 3. 락 획득 후 기부 정보 리셋 및 보유 정보 업데이트
-    cur->wait_on_lock = NULL; // 락을 획득했으므로 대기 중인 락 리셋
-
-    // 4. 락 보유 정보 및 holding_locks 업데이트
-    lock->holder = cur;
-    list_push_back(&cur->holding_locks, &lock->elem); 
-
-    intr_set_level (old_level);
-}
-
-/* Tries to acquire LOCK and returns true if successful. (중략) */
-
-/* Releases LOCK. */
-void
-lock_release (struct lock *lock)
-{
-    enum intr_level old_level;
-    struct thread *cur = thread_current();
-
-    ASSERT (lock != NULL);
-    ASSERT (!intr_context ());
-    ASSERT (lock_held_by_current_thread (lock));
-
-    old_level = intr_disable();
-
-    // 1. holding_locks에서 락 제거
-    list_remove(&lock->elem);
-
-    // 2. 락 보유자 정보 초기화 및 max_priority 리셋
-    lock->holder = NULL;
-    // lock->max_priority는 lock_acquire에서 대기하는 스레드가 설정하므로, 
-    // holder가 없을 때 PRI_MIN으로 리셋하는 것이 적절
-    lock->max_priority = PRI_MIN; 
-
-    // 3. 락 해제 후 현재 스레드의 우선순위 재계산 및 선점 확인
-    thread_remove_lock(lock); 
-    
-    // 4. 세마포어 업 (대기 스레드 깨우기)
-    sema_up (&lock->semaphore);
-
-    intr_set_level (old_level);
-}
-
-/* Returns true if the current thread holds LOCK, false otherwise. (중략) */
-
-/* Initializes condition variable COND. */
-void
-cond_init (struct condition *cond)
-{
-    list_init (&cond->waiters);
-}
-
-/* Atomically releases LOCK and waits for COND to be signaled. (중략) */
+   The lock is released before the thread blocks and reacquired
+   before it is unblocked. */
 void
 cond_wait (struct condition *cond, struct lock *lock)
 {
     struct semaphore_elem waiter;
-    struct thread *cur = thread_current();
 
     ASSERT (cond != NULL);
     ASSERT (lock != NULL);
@@ -153,21 +151,21 @@ cond_wait (struct condition *cond, struct lock *lock)
     ASSERT (lock_held_by_current_thread (lock));
 
     sema_init (&waiter.semaphore, 0);
-    list_push_back (&cond->waiters, &waiter.elem);
+    // 조건 변수 대기열은 FIFO를 유지 (세마포어의 대기열이 우선순위 정렬을 담당)
+    list_push_back (&cond->waiters, &waiter.elem); 
     
-    // Cond Wait 동안은 락을 기다리는 상태가 아니므로 wait_on_lock을 초기화
-    cur->wait_on_lock = NULL;
-
-    // 🚨 [수정] lock_release에 락 해제 및 우선순위 회수 로직을 위임.
-    lock_release (lock); 
-
-    sema_down (&waiter.semaphore);
-
-    // 다시 lock을 획득
+    lock_release (lock);
+    sema_down (&waiter.semaphore); // sema_down에서 우선순위 정렬이 적용됨
     lock_acquire (lock);
 }
 
-/* If any threads are waiting on COND (protected by LOCK), then (중략) */
+/* If any threads are waiting on COND (protected by LOCK), then
+   this function signals one of them to wake up from its wait.
+   LOCK must be held before calling this function.
+
+   An interrupt handler cannot acquire a lock, so it does not
+   make sense to try to signal a condition variable within an
+   interrupt handler. */
 void
 cond_signal (struct condition *cond, struct lock *lock UNUSED)
 {
@@ -177,14 +175,20 @@ cond_signal (struct condition *cond, struct lock *lock UNUSED)
     ASSERT (lock_held_by_current_thread (lock));
 
     if (!list_empty (&cond->waiters))
+        // FIFO 순으로 대기 중인 세마포어 엘리먼트를 꺼낸다.
         sema_up (&list_entry (list_pop_front (&cond->waiters),
                               struct semaphore_elem, elem)
                       ->semaphore);
 }
 
-/* Wakes up all threads, if any, waiting on COND (protected by (중략) */
+/* Wakes up all threads, if any, waiting on COND (protected by
+   LOCK).  LOCK must be held before calling this function.
+
+   An interrupt handler cannot acquire a lock, so it does not
+   make sense to try to signal a condition variable within an
+   interrupt handler. */
 void
-cond_broadcast (struct condition *cond, struct lock *lock UNUSED)
+cond_broadcast (struct condition *cond, struct lock *lock)
 {
     ASSERT (cond != NULL);
     ASSERT (lock != NULL);
