@@ -6,6 +6,7 @@
 #include <debug.h>
 #include <list.h>
 #include <stdint.h>
+#include "threads/synch.h" // struct lock 사용을 위해 추가
 
 /* States in a thread's life cycle. */
 enum thread_status
@@ -27,7 +28,7 @@ typedef int tid_t;
 #define PRI_MAX 63     /* Highest priority. */
 
 // ===================================================================
-// *** MODIFICATION: MLFQS 및 Aging 상수/Enum 정의 ***
+// *** MODIFICATION: MLFQS 및 Aging 상수/Enum 정의 (기존 코드를 유지하며) ***
 
 // Simplified MLFQS 큐 레벨 정의
 enum mlfqs_queue 
@@ -90,7 +91,7 @@ struct thread
     struct list_elem allelem;  /* List element for all threads list. */
 
     /* Shared between thread.c and synch.c. */
-    struct list_elem elem;     /* List element. */
+    struct list_elem elem; /* List element. */
     
     // ===================================================================
     // *** MODIFICATION: Aging, MLFQS, Priority Donation 멤버 추가 ***
