@@ -73,9 +73,9 @@ thread_init (void)
 void
 thread_tick (void)
 {
-    struct thread *t = thread_current ();
-    /* ... (통계 업데이트 기존 로직) ... */
+   struct thread *t = thread_current ();
     
+    /* 기존: 통계 업데이트 로직 */
     if (t == idle_thread)
         idle_ticks++;
 #ifdef USERPROG
@@ -87,19 +87,27 @@ thread_tick (void)
 
     /* [수정] MLFQS/Aging 로직 추가 */
     if (thread_mlfqs) {
+        // MLFQS 모드: 
+        // 1. 현재 스레드의 recent_cpu 증가 (mlfq_update 내부에서 처리될 수 있음)
+        // 2. 큐별 Time Slice 소모 및 강등 처리 (내부에서 yield 유도)
+        // 3. 대기 스레드 에이징 및 승급 처리 (내부에서 yield 유도)
         mlfq_update();
     }
     else {
+        // Priority Scheduling 모드:
+        // 대기 스레드 에이징 (priority++ 및 ready_list 재정렬)
         aging_ready_threads(); 
     }
     
     /* Enforce preemption. */
-    if (++thread_ticks >= TIME_SLICE)
-        intr_yield_on_return ();
+    // [수정] MLFQS 모드에서는 mlfq_update에서 큐별 time slice를 관리하므로,
+    // 일반 Priority Scheduling 모드에서만 기존 TIME_SLICE을 사용하여 라운드 로빈 정책을 유지합니다.
+    if (thread_mlfqs == false) {
+        if (++thread_ticks >= TIME_SLICE)
+            intr_yield_on_return ();
+    }
+    // MLFQS 모드의 타임 슬라이스(Q0: 2, Q1: 4, Q2: 8)는 mlfq_update() 내에서 관리됩니다.
 }
-/* (중략) thread_create, thread_block - 기존과 동일 */
-
-/* thread_unblock - priority/mlfqs 분기 및 선점 로직 추가 */
 void
 thread_unblock (struct thread *t)
 {
@@ -108,16 +116,16 @@ thread_unblock (struct thread *t)
 
     old_level = intr_disable ();
     ASSERT (t->status == THREAD_BLOCKED);
-    
+     
     t->status = THREAD_READY;
-    
+     
     if (thread_mlfqs == false) {
         /* Priority Scheduling: 우선순위 순으로 삽입 */
         list_insert_ordered (&ready_list, &t->elem, thread_cmp_priority, NULL);
 
         /* 선점 (Unblock된 스레드가 현재 스레드보다 우선순위가 높으면 yield) */
         if (t->priority > thread_current()->priority && !intr_context())
-             thread_yield();
+            thread_yield();
     }
     else { 
         /* MLFQS Scheduling: Q0으로 초기화하고 push_back */
@@ -126,16 +134,15 @@ thread_unblock (struct thread *t)
             t->age[0] = t->age[1] = t->age[2] = 0;
         }
         list_push_back(&mlfq[t->queue_level], &t->elem);
-        
-        // MLFQS의 선점은 next_thread_to_run에서 처리되거나, mlfq_update의 승급/강등 후 yield로 처리됨.
+         
+        // [추가] MLFQS 선점 로직: 언블록된 스레드가 현재 스레드보다 높은 큐 레벨(낮은 인덱스)에 위치하면 선점
+        if (t->queue_level < thread_current()->queue_level) {
+            intr_yield_on_return();
+        }
     }
 
     intr_set_level (old_level);
 }
-
-/* (중략) thread_name, thread_current, thread_tid, thread_exit - 기존과 동일 */
-
-/* thread_yield - priority/mlfqs 분기 */
 void
 thread_yield (void)
 {
@@ -303,15 +310,19 @@ thread_remove_lock(struct lock *lock)
 {
     struct thread *cur = thread_current();
     int new_priority = cur->original_priority;
+     
+    // list_remove(&cur->holding_locks, &lock->elem); // lock을 해제했으니 holding_locks에서 제거하는 로직이 필요.
+                                                      // (lock_release에서 이미 처리하고 있다면 생략 가능)
     
     // 보유 락 목록을 순회하며 남아있는 락 중 가장 높은 기부 우선순위를 찾음
     if (!list_empty(&cur->holding_locks)) {
+        // [유지] holding_locks 리스트의 최대 우선순위 락을 찾음
         struct list_elem *e = list_max(&cur->holding_locks, thread_cmp_lock_priority, NULL);
         struct lock *l = list_entry(e, struct lock, elem);
         if (l->max_priority > new_priority)
             new_priority = l->max_priority;
     }
-    
+     
     // 최종 우선순위를 업데이트하고, 필요시 선점을 유도
     if (cur->priority != new_priority) {
         cur->priority = new_priority;
@@ -319,8 +330,6 @@ thread_remove_lock(struct lock *lock)
             thread_yield();
     }
 }
-
-/* aging_ready_threads - 일반 우선순위 스케줄링 모드에서의 에이징 */
 void
 aging_ready_threads(void)
 {
