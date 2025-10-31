@@ -3,7 +3,6 @@
 
 #include <list.h>
 #include <stdbool.h>
-#include "threads/thread.h" // struct thread 사용을 위해 추가
 
 /* A counting semaphore. */
 struct semaphore
@@ -21,12 +20,8 @@ void sema_self_test (void);
 /* Lock. */
 struct lock
 {
-    struct thread *holder;       /* Thread holding lock (for debugging). */
-    struct semaphore semaphore;  /* Binary semaphore controlling access. */
-    
-    /* 🚨 [Priority Donation Fields] 🚨 */
-    int max_priority;            /* The highest priority of threads waiting on this lock. */
-    struct list_elem elem;       /* List element for thread's holding_locks list. */
+    struct thread *holder;      /* Thread holding lock (for debugging). */
+    struct semaphore semaphore; /* Binary semaphore controlling access. */
 };
 
 void lock_init (struct lock *);
@@ -46,7 +41,11 @@ void cond_wait (struct condition *, struct lock *);
 void cond_signal (struct condition *, struct lock *);
 void cond_broadcast (struct condition *, struct lock *);
 
-/* Optimization barrier. */
+/* Optimization barrier.
+
+   The compiler will not reorder operations across an
+   optimization barrier.  See "Optimization Barriers" in the
+   reference guide for more information.*/
 #define barrier() asm volatile ("" : : : "memory")
 
 #endif /* threads/synch.h */
