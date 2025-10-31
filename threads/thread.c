@@ -175,50 +175,68 @@ thread_yield (void)
 /* threads/thread.c */
 // (추가 함수) 스레드가 현재 보유한 락을 기준으로 유효 우선순위를 다시 계산하는 함수
 void
-thread_recalculate_priority (struct thread *t)
+thread_recalculate_priority(struct thread *t)
 {
-    // 스레드의 '원래' 우선순위(original_priority)로 시작
+    // MLFQS 모드일 경우 무시
+    if (thread_mlfqs == true) return;
+    
+    // 원래 우선순위(original_priority)로 시작
     int new_effective_priority = t->original_priority;
-
-    // 1. 보유한 모든 락을 순회하며 가장 높은 기부 우선순위를 찾음
+    
+    // 보유한 모든 락의 최대 기부 우선순위를 찾습니다.
     if (!list_empty(&t->holding_locks)) {
         struct list_elem *e;
-        for (e = list_begin(&t->holding_locks); e != list_end(&t->holding_locks); e = list_next(e))
-        {
+        int max_donated_priority = PRI_MIN;
+        
+        // holding_locks 리스트를 직접 순회하여 최대 max_priority를 찾습니다.
+        for (e = list_begin(&t->holding_locks); e != list_end(&t->holding_locks); e = list_next(e)) {
+            // lock 구조체는 synch.h에서 정의되었으므로, 해당 lock 구조체에
+            // max_priority를 저장하는 필드가 존재해야 합니다.
             struct lock *l = list_entry(e, struct lock, elem);
-            // 락이 기부한 max_priority가 현재 계산된 유효 우선순위보다 높으면 갱신
-            if (l->max_priority > new_effective_priority) {
-                new_effective_priority = l->max_priority;
+            if (l->max_priority > max_donated_priority) {
+                max_donated_priority = l->max_priority;
             }
         }
+        
+        // 최종 유효 우선순위 = max(original_priority, max_donated_priority)
+        if (max_donated_priority > new_effective_priority) {
+            new_effective_priority = max_donated_priority;
+        }
     }
+    
+    // 우선순위가 변경된 경우에만 업데이트 및 리스트 위치 갱신
+    if (t->priority != new_effective_priority) {
+        t->priority = new_effective_priority;
 
-    // 2. 새로운 유효 우선순위를 설정
-    t->priority = new_effective_priority;
+        // ready 상태였고 우선순위가 변경되었다면, ready_list에서 위치를 갱신
+        if (t->status == THREAD_READY) {
+            list_remove(&t->elem);
+            list_insert_ordered(&ready_list, &t->elem, thread_cmp_priority, NULL);
+        }
+    }
 }
 
 
 // (메인 함수) 사용자 요청에 의해 호출됨
 void
-thread_set_priority(int new_priority)
+thread_set_priority(int new_priority) 
 {
-    enum intr_level old_level = intr_disable();
-    struct thread *cur = thread_current();
+    enum intr_level old_level = intr_disable();
+    struct thread *cur = thread_current();
+    
+    if (thread_mlfqs == false) {
+        // 1. 원래 우선순위(original_priority)를 먼저 업데이트
+        cur->original_priority = new_priority;
+        
+        // 2. 새로운 유효 우선순위를 계산하고 cur->priority에 반영 (직접 순회 로직 사용)
+        thread_recalculate_priority(cur);
 
-    if (thread_mlfqs == false) {
-        // 1. 원래 우선순위(original_priority) 업데이트
-        cur->original_priority = new_priority;
-        
-        // 2. 보유한 락을 기반으로 유효 우선순위 재계산
-        thread_recalculate_priority(cur);
-
-        // 3. 선점 로직 (중요): 새로운 우선순위가 ready_list의 최고 우선순위보다 낮으면 yield
-        // 'priority-change' 테스트 통과를 위해 필수
-        if (!list_empty(&ready_list) && cur->priority < thread_get_max_ready_priority()) {
-            thread_yield();
-        }
-    }
-    intr_set_level(old_level);
+        // 3. 선점 로직 (priority-change 테스트 통과를 위한 핵심)
+        // 새로운 우선순위가 ready_list의 최고 우선순위보다 낮아지면 yield (선점)
+        if (!list_empty(&ready_list) && cur->priority < thread_get_max_ready_priority())
+            thread_yield();
+    }
+    intr_set_level(old_level);
 }
 
 /* (중략) thread_get_priority ~ thread_get_recent_cpu - 기존과 동일 */
@@ -326,27 +344,20 @@ thread_donate_priority(struct thread *t, int priority)
 void
 thread_remove_lock(struct lock *lock)
 {
-    struct thread *cur = thread_current();
-    int new_priority = cur->original_priority;
-     
-    // list_remove(&cur->holding_locks, &lock->elem); // lock을 해제했으니 holding_locks에서 제거하는 로직이 필요.
-                                                      // (lock_release에서 이미 처리하고 있다면 생략 가능)
+    struct thread *cur = thread_current();
+    enum intr_level old_level = intr_disable();
+
+    // 참고: 락 해제 로직(holding_locks에서 lock 제거)은 synch.c의 lock_release에서
+    // intr_disable() 상태로 처리하는 것이 일반적입니다. 여기서는 재계산만 수행합니다.
+
+    // 새로운 유효 우선순위를 계산하고 cur->priority에 반영 (직접 순회 로직 사용)
+    thread_recalculate_priority(cur);
+     
+    // 우선순위가 낮아진 경우 선점 유도 (priority-sema 테스트를 위한 핵심)
+    if (cur->priority < thread_get_max_ready_priority() && !intr_context())
+        thread_yield();
     
-    // 보유 락 목록을 순회하며 남아있는 락 중 가장 높은 기부 우선순위를 찾음
-    if (!list_empty(&cur->holding_locks)) {
-        // [유지] holding_locks 리스트의 최대 우선순위 락을 찾음
-        struct list_elem *e = list_max(&cur->holding_locks, thread_cmp_lock_priority, NULL);
-        struct lock *l = list_entry(e, struct lock, elem);
-        if (l->max_priority > new_priority)
-            new_priority = l->max_priority;
-    }
-     
-    // 최종 우선순위를 업데이트하고, 필요시 선점을 유도
-    if (cur->priority != new_priority) {
-        cur->priority = new_priority;
-        if (cur->priority < thread_get_max_ready_priority() && !intr_context())
-            thread_yield();
-    }
+    intr_set_level(old_level);
 }
 void
 aging_ready_threads(void)
