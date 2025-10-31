@@ -3,6 +3,7 @@
 
 #include <list.h>
 #include <stdbool.h>
+#include "threads/thread.h" // struct thread 사용을 위해 추가
 
 /* A counting semaphore. */
 struct semaphore
@@ -23,7 +24,7 @@ struct lock
     struct thread *holder;       /* Thread holding lock (for debugging). */
     struct semaphore semaphore;  /* Binary semaphore controlling access. */
     
-    // [추가] Priority Donation을 위한 필드
+    /* 🚨 [Priority Donation Fields] 🚨 */
     int max_priority;            /* The highest priority of threads waiting on this lock. */
     struct list_elem elem;       /* List element for thread's holding_locks list. */
 };
