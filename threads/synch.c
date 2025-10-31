@@ -183,8 +183,9 @@ lock_init (struct lock *lock)
 
     lock->holder = NULL;
     sema_init (&lock->semaphore, 1);
+    // [추가] Priority Donation 필드 초기화
+    lock->max_priority = PRI_MIN; 
 }
-
 /* Acquires LOCK, sleeping until it becomes available if
    necessary.  The lock must not already be held by the current
    thread.
@@ -196,12 +197,39 @@ lock_init (struct lock *lock)
 void
 lock_acquire (struct lock *lock)
 {
+    enum intr_level old_level;
+    struct thread *cur = thread_current();
+
     ASSERT (lock != NULL);
     ASSERT (!intr_context ());
     ASSERT (!lock_held_by_current_thread (lock));
 
+    old_level = intr_disable();
+
+    // 1. Priority Donation: 락 보유자에게 우선순위 기부
+    if (lock->holder != NULL) {
+        // 현재 스레드가 대기해야 하므로, 락과 락 보유자에게 자신의 우선순위를 기부
+        cur->wait_on_lock = lock;
+        if (cur->priority > lock->max_priority) {
+            lock->max_priority = cur->priority;
+            thread_donate_priority(lock->holder, cur->priority);
+        }
+    }
+
+    // 2. 세마포어 다운 (블록)
     sema_down (&lock->semaphore);
-    lock->holder = thread_current ();
+
+    // 3. 락 획득 후 기부 정보 리셋
+    cur->wait_on_lock = NULL; // 락을 획득했으므로 대기 중인 락 리셋
+
+    // 4. 락 보유 정보 및 holding_locks 업데이트
+    lock->holder = cur;
+    list_push_back(&cur->holding_locks, &lock->elem); // 스레드가 보유한 락 목록에 추가
+
+    // 5. 락의 max_priority 리셋 (나중에 lock_release에서 다시 계산됨)
+    lock->max_priority = PRI_MIN;
+
+    intr_set_level (old_level);
 }
 
 /* Tries to acquires LOCK and returns true if successful or false
@@ -232,11 +260,23 @@ lock_try_acquire (struct lock *lock)
 void
 lock_release (struct lock *lock)
 {
+    enum intr_level old_level;
     ASSERT (lock != NULL);
     ASSERT (lock_held_by_current_thread (lock));
 
+    old_level = intr_disable();
+
+    // 1. 보유 락 목록에서 제거
+    list_remove(&lock->elem); 
+
+    // 2. 우선순위 회수 (나머지 락 중 가장 높은 기부 우선순위로 복원)
+    thread_remove_lock(lock);
+
+    // 3. 락 해제 및 대기자 깨우기
     lock->holder = NULL;
     sema_up (&lock->semaphore);
+
+    intr_set_level(old_level);
 }
 
 /* Returns true if the current thread holds LOCK, false
@@ -292,6 +332,7 @@ void
 cond_wait (struct condition *cond, struct lock *lock)
 {
     struct semaphore_elem waiter;
+    struct thread *cur = thread_current();
 
     ASSERT (cond != NULL);
     ASSERT (lock != NULL);
@@ -300,8 +341,22 @@ cond_wait (struct condition *cond, struct lock *lock)
 
     sema_init (&waiter.semaphore, 0);
     list_push_back (&cond->waiters, &waiter.elem);
-    lock_release (lock);
+
+    // [추가] 락을 놓기 전에, 현재 스레드가 락을 보유 중이라는 정보를 holding_locks에서 제거
+    list_remove(&lock->elem);
+    // [추가] 락을 놓으므로 우선순위 회수. (락이 없으므로 wait_on_lock을 업데이트할 필요는 없음)
+    thread_remove_lock(lock); 
+
+    lock_release (lock); // 기존 lock_release는 lock->holder = NULL; sema_up만 수행
+
+    // [추가] sema_down 전에 lock->wait_on_lock = NULL;을 설정
+    // 이 스레드는 이제 락이 아닌 조건 변수의 세마포어에서 대기하므로, 
+    // 외부로부터의 우선순위 기부 대상을 NULL로 리셋해야 합니다.
+    // 다만, Pintos에서는 `thread_block` 직전에 `wait_on_lock`을 업데이트하지 않고,
+    // `lock_acquire`에서만 사용하므로 이 부분은 `thread` 구조체 설계에 따라 다를 수 있습니다.
+
     sema_down (&waiter.semaphore);
+
     lock_acquire (lock);
 }
 
