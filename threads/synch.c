@@ -114,14 +114,12 @@ sema_up (struct semaphore *sema)
 
     old_level = intr_disable ();
     if (!list_empty (&sema->waiters)){
-       list_sort(&sema->waiters, thread_cmp_priority, NULL);
+        // 정렬된 리스트에서 가장 높은 우선순위 스레드(맨 앞)를 pop
         thread_unblock (list_entry (list_pop_front (&sema->waiters),
                                     struct thread, elem));
     }
     sema->value++;
     intr_set_level (old_level);
-
-   thread_yield();
 }
 
 static void sema_test_helper (void *sema_);
@@ -194,6 +192,8 @@ lock_init (struct lock *lock)
    interrupt handler.  This function may be called with
    interrupts disabled, but interrupts will be turned back on if
    we need to sleep. */
+/* Acquires LOCK, sleeping until it becomes available if
+   necessary. ... */
 void
 lock_acquire (struct lock *lock)
 {
@@ -219,16 +219,12 @@ lock_acquire (struct lock *lock)
     // 2. 세마포어 다운 (블록)
     sema_down (&lock->semaphore);
 
-    // 3. 락 획득 후 기부 정보 리셋
+    // 3. 락 획득 후 기부 정보 리셋 및 보유 정보 업데이트
     cur->wait_on_lock = NULL; // 락을 획득했으므로 대기 중인 락 리셋
 
     // 4. 락 보유 정보 및 holding_locks 업데이트
     lock->holder = cur;
     list_push_back(&cur->holding_locks, &lock->elem); // 스레드가 보유한 락 목록에 추가
-
-    // 5. 락의 max_priority 리셋 (나중에 lock_release에서 다시 계산됨)
-    lock->max_priority = PRI_MIN;
-
     intr_set_level (old_level);
 }
 
@@ -261,18 +257,30 @@ void
 lock_release (struct lock *lock)
 {
     enum intr_level old_level;
+    struct thread *cur = thread_current();
+
     ASSERT (lock != NULL);
     ASSERT (lock_held_by_current_thread (lock));
 
     old_level = intr_disable();
 
     // 1. 보유 락 목록에서 제거
-    list_remove(&lock->elem); 
+    list_remove(&lock->elem); // lock을 해제했으므로 holding_locks에서 제거
 
-    // 2. 우선순위 회수 (나머지 락 중 가장 높은 기부 우선순위로 복원)
-    thread_remove_lock(lock);
+    // 2. 현재 스레드의 우선순위 회수 및 재계산 (thread.c의 thread_remove_lock에서 수행)
+    thread_remove_lock(lock); 
 
-    // 3. 락 해제 및 대기자 깨우기
+    // 3. 락의 max_priority 갱신: 세마포어 대기자 중 최고 우선순위 반영
+    if (!list_empty(&lock->semaphore.waiters)) {
+        // sema_up 전에 대기자 리스트가 우선순위 순으로 정렬되어야 합니다.
+        // 리스트가 정렬되어 있다고 가정하고 맨 앞 스레드의 우선순위를 사용
+        struct thread *highest_waiter = list_entry(list_front(&lock->semaphore.waiters), struct thread, elem);
+        lock->max_priority = highest_waiter->priority;
+    } else {
+        lock->max_priority = PRI_MIN;
+    }
+
+    // 4. 락 해제 및 대기자 깨우기
     lock->holder = NULL;
     sema_up (&lock->semaphore);
 
@@ -301,13 +309,23 @@ struct semaphore_elem
    allows one piece of code to signal a condition and cooperating
    code to receive the signal and act upon it. */
 void
-cond_init (struct condition *cond)
+cond_wait (struct condition *cond, struct lock *lock)
 {
-    ASSERT (cond != NULL);
+    struct semaphore_elem waiter;
+    struct thread *cur = thread_current();
 
-    list_init (&cond->waiters);
+    // ... ASSERT 및 sema_init, list_push_back ...
+
+    // 다음 두 줄을 제거합니다. lock_release 내부에서 처리됩니다.
+    // list_remove(&lock->elem);
+    // thread_remove_lock(lock); 
+
+    lock_release (lock); // lock_release 호출 시 락 해제 및 우선순위 회수 자동 수행
+
+    sema_down (&waiter.semaphore);
+
+    lock_acquire (lock);
 }
-
 /* Atomically releases LOCK and waits for COND to be signaled by
    some other piece of code.  After COND is signaled, LOCK is
    reacquired before returning.  LOCK must be held before calling
