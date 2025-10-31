@@ -84,7 +84,7 @@ timer_elapsed (int64_t then)
     return timer_ticks () - then;
 }
 
-/* Sleeps for approximately TICKS timer ticks.  Interrupts must
+/* Sleeps for approximately TICKS timer ticks. Interrupts must
    be turned on. */
 void
 timer_sleep (int64_t ticks)
@@ -103,16 +103,13 @@ timer_sleep (int64_t ticks)
     cur->wake_up_tick = ticks + timer_ticks();
 
     // 2. Sleep Queue에 삽입 (깨어날 시간 순으로 정렬하여 삽입)
-    // Pintos의 sleep_list는 일반적으로 'struct thread'의 'elem'을 사용하며,
-    // 정렬된 삽입이 일반적입니다.
     list_insert_ordered (&sleep_list, &cur->elem, thread_cmp_wake_up_tick, NULL);
 
     // 3. 현재 스레드를 BLOCKED 상태로 전환
     thread_block ();
 
-    intr_set_level (old_level);
+    intr_set_level (old_level); // 깨어난 후 인터럽트를 복원
 }
-
 // [추가 필요] thread.h 또는 timer.h에 thread_cmp_wake_up_tick 함수 선언
 // bool thread_cmp_wake_up_tick(const struct list_elem *a, const struct list_elem *b, void *aux UNUSED);
 
@@ -194,26 +191,26 @@ timer_interrupt (struct intr_frame *args UNUSED)
     struct thread *t;
 
     ticks++;
-    
-    // [추가] Sleep Queue 확인 및 깨우기 로직
-    // sleep_list를 순회하며 깨울 시간이 된 스레드(wake_up_tick <= ticks)를 unblock
-    e = list_begin (&sleep_list);
-    while (e != list_end (&sleep_list)) {
+    thread_tick (); // 먼저 thread_tick을 호출하여 현재 스레드의 타임 슬라이스 관리
+
+    // [수정] Sleep Queue 확인 및 깨우기 로직 (정렬된 리스트 가정)
+    enum intr_level old_level = intr_disable (); // 락 대신 intr_disable 사용
+
+    while (!list_empty(&sleep_list)) {
+        e = list_begin(&sleep_list);
         t = list_entry (e, struct thread, elem);
+        
+        // 깨어날 시간이 되었으면
         if (t->wake_up_tick <= ticks) {
-            e = list_next(e); // list_remove 전에 next 엘리먼트 미리 저장
             list_remove(&t->elem);
             thread_unblock (t);
         } else {
-            // 리스트가 wake_up_tick 순으로 정렬되어 있다면, 
-            // 현재 스레드가 깰 시간이 안 됐다면 나머지 스레드도 검사할 필요 없음.
-            // 하지만 정렬이 안 되어 있을 수도 있으므로, 일단은 순회 유지.
-            e = list_next(e); 
+            // 리스트가 정렬되어 있으므로, 첫 스레드가 깨지 않으면 나머지도 깰 수 없음
+            break; 
         }
     }
     
-    thread_tick ();
-    // [수정] mlfq_update() 제거. thread_tick() 내부에서 thread_mlfqs에 따라 처리됨.
+    intr_set_level(old_level);
 }
 
 /* Returns true if LOOPS iterations waits for more than one timer
