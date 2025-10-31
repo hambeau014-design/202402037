@@ -131,7 +131,7 @@ sema_up (struct semaphore *sema)
     intr_set_level (old_level);
 }
 
-/* ... (나머지 기존 함수: sema_self_test, lock_init, lock_acquire, lock_try_acquire, lock_release, lock_held_by_current_thread, cond_init) ... */
+/* ... (sema_self_test, lock_init, lock_acquire, lock_try_acquire, lock_release, lock_held_by_current_thread, cond_init) ... */
 
 /* Waits on condition variable COND, which must be protected by
    LOCK. The current thread is blocked until another thread calls
@@ -151,7 +151,7 @@ cond_wait (struct condition *cond, struct lock *lock)
     ASSERT (lock_held_by_current_thread (lock));
 
     sema_init (&waiter.semaphore, 0);
-    // 조건 변수 대기열은 FIFO를 유지 (세마포어의 대기열이 우선순위 정렬을 담당)
+    // 조건 변수 대기열은 FIFO를 유지 (핵심 우선순위 정렬은 sema_down에서 처리)
     list_push_back (&cond->waiters, &waiter.elem); 
     
     lock_release (lock);
