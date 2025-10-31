@@ -1,3 +1,5 @@
+/* thread.c */
+
 #include "threads/thread.h"
 #include <debug.h>
 #include <stddef.h>
@@ -11,36 +13,64 @@
 #include "threads/switch.h"
 #include "threads/synch.h"
 #include "threads/vaddr.h"
-#include "devices/timer.h" // thread_cmp_wake_up_tick 선언을 포함하기 위해 추가
 #ifdef USERPROG
 #include "userprog/process.h"
 #endif
 
-/* Global State */
-static struct list ready_list;      /* List of threads ready to run. */
-static struct list all_list;       /* List of all threads. */
-static struct thread *idle_thread; /* The idle thread. */
-static struct thread *initial_thread; /* The thread that executes main(). */
-static struct lock tid_lock;       /* Lock for tid allocator. */
-int thread_ticks;                  /* # of timer ticks since last yield. */
+/* Random value for struct thread's `magic' member.
+   Used to detect stack overflow.  See the big comment at the top
+   of thread.h for details. */
+#define THREAD_MAGIC 0xcd6abf4b
 
-/* MLFQS Global Variables */
-struct list mlfq[3];               /* Multi-level feedback queues (Q0, Q1, Q2). */
-bool thread_mlfqs;                 /* MLFQS control flag. */
+/* List of processes in THREAD_READY state, that is, processes
+   that are ready to run but not actually running. */
+// ===================================================================
+// *** MODIFICATION: ready_list를 MLFQS용 큐로 확장 ***
+static struct list ready_list;      // 일반 우선순위 스케줄링용 (기존)
+static struct list ready_list_q0;   // MLFQS Q0
+static struct list ready_list_q1;   // MLFQS Q1
+static struct list ready_list_q2;   // MLFQS Q2
+// ===================================================================
+
+/* List of all processes.  Processes are added to this list
+   when they are first scheduled and removed when they exit. */
+static struct list all_list;
+
+/* List of process in sleep */
+static struct list sleep_list;
+static int64_t next_tick_to_wakeup = INT64_MAX;
+
+/* Idle thread. */
+static struct thread *idle_thread;
+
+/* Initial thread, the thread running init.c:main(). */
+static struct thread *initial_thread;
+
+/* Lock used by allocate_tid(). */
+static struct lock tid_lock;
+
+/* Stack frame for kernel_thread(). */
+struct kernel_thread_frame 
+{
+    void *eip;                  /* Return address. */
+    thread_func *function;      /* Function to call. */
+    void *aux;                  /* Auxiliary data for function. */
+};
 
 /* Statistics. */
-static long long idle_ticks;   /* # of timer ticks spent idle. */
-static long long kernel_ticks; /* # of timer ticks in kernel threads. */
-static long long user_ticks;   /* # of timer ticks in user programs. */
+static long long idle_ticks;    /* # of timer ticks spent in idle state. */
+static long long kernel_ticks;  /* # of timer ticks spent in kernel threads. */
+static long long user_ticks;    /* # of timer ticks spent in user processes. */
 
-/* MLFQ Constants */
-#define TIME_SLICE 4 // 기존 라운드 로빈 TIME_SLICE
-#define TIME_SLICE_Q0 2
-#define TIME_SLICE_Q1 4
-#define TIME_SLICE_Q2 8
-#define AGE_LIMIT 20
+/* Scheduling. */
+#define TIME_SLICE 4            /* # of timer ticks to give each thread. */
+static unsigned thread_ticks;   /* # of timer ticks since last yield. */
 
-/* Function declarations */
+/* If false (default), use round-robin scheduler.
+   If true, use multi-level feedback queue scheduler.
+   Controlled by kernel command-line option "-o mlfqs". */
+bool thread_mlfqs;
+
 static void kernel_thread (thread_func *, void *aux);
 static void idle (void *aux UNUSED);
 static struct thread *running_thread (void);
@@ -52,88 +82,214 @@ static void schedule (void);
 void thread_schedule_tail (struct thread *prev);
 static tid_t allocate_tid (void);
 
-/* Priority and Donation Functions */
-bool thread_cmp_priority(const struct list_elem *a, const struct list_elem *b, void *aux UNUSED);
-bool thread_cmp_wake_up_tick(const struct list_elem *a, const struct list_elem *b, void *aux UNUSED); // Timer Sleep용
-int thread_get_max_ready_priority(void);
-void thread_donate_priority(struct thread *t, int priority);
-void thread_remove_lock(struct lock *lock);
-void thread_recalculate_priority(struct thread *t);
+// ===================================================================
+// *** MODIFICATION: 헬퍼 함수 구현 ***
 
-/* Scheduling and Aging Functions */
-void mlfq_update(void);
-void aging_ready_threads(void);
+/* 주어진 큐 레벨에 해당하는 list 구조체를 반환합니다. */
+static struct list *mlfqs_get_queue(enum mlfqs_queue level) {
+  switch (level) {
+    case Q0: return &ready_list_q0;
+    case Q1: return &ready_list_q1;
+    case Q2: return &ready_list_q2;
+    default: NOT_REACHED ();
+  }
+}
 
-/* Initializes the threading system by transforming the code that's currently
-   running into a thread. */
+/* 우선순위 비교 함수: t1의 우선순위가 t2보다 높으면(list에서 더 앞쪽에 위치해야 하면) true 반환 */
+bool
+priority_less (const struct list_elem *a, const struct list_elem *b,
+               void *aux UNUSED)
+{
+  struct thread *t1 = list_entry (a, struct thread, elem);
+  struct thread *t2 = list_entry (b, struct thread, elem);
+  return t1->priority > t2->priority; 
+}
+// ===================================================================
+
+
+/* Initializes the threading system by transforming the code
+   that's currently running into a thread.  This can't work in
+   all situations, but it does in ours because a thread doesn't
+   have any special prepocessing or need a separate stack.
+
+   We also initialize the run queue and the tid lock.
+
+   After calling this function, be sure to initialize the page
+   allocator before trying to create any threads with
+   thread_create().
+
+   It is safe to call this function multiple times. */
 void
 thread_init (void)
 {
     ASSERT (intr_get_level () == INTR_OFF);
 
     lock_init (&tid_lock);
-    list_init (&ready_list);
+    
+    // ===================================================================
+    // *** MODIFICATION: MLFQS 큐 초기화 ***
+    if (thread_mlfqs) {
+        list_init (&ready_list_q0);
+        list_init (&ready_list_q1);
+        list_init (&ready_list_q2);
+    } else {
+        list_init (&ready_list); // 기존 ready_list 초기화
+    }
+    // ===================================================================
+
     list_init (&all_list);
+    list_init (&sleep_list);
 
-    list_init(&mlfq[0]);
-    list_init(&mlfq[1]);
-    list_init(&mlfq[2]);
-
-    /* Set up a thread structure for the running thread. */
+    /* Set up a thread structure for the running code. */
     initial_thread = running_thread ();
     init_thread (initial_thread, "main", PRI_DEFAULT);
     initial_thread->status = THREAD_RUNNING;
     initial_thread->tid = allocate_tid ();
 }
 
-/* Starts the scheduler by enabling interrupts and switching to the idle thread. */
+/* Starts the scheduler -- enables interrupts and runs the idle
+   thread.  After calling this function, no one should ever call
+   thread_yeild() directly, since the scheduler should be managing
+   the running threads. */
 void
 thread_start (void)
 {
     /* Create the idle thread. */
-    struct semaphore idle_started;
-    sema_init (&idle_started, 0);
-    thread_create ("idle", PRI_MIN, idle, &idle_started);
+    idle_thread = thread_create ("idle", PRI_MIN, idle, NULL);
 
     /* Start preemptive thread scheduling. */
     intr_enable ();
-
-    /* Wait for the idle thread to initialize idle_thread. */
-    sema_down (&idle_started);
 }
 
 /* Called by the timer interrupt handler at each timer tick.
-   Interrupts must be disabled. */
+   Each time a timer tick comes in, we increment `thread_ticks'.
+   The first TIME_SLICE* threads to be run are chosen in round-robin
+   fashion.  After that, the scheduler makes a new choice. */
 void
 thread_tick (void)
 {
-    struct thread *t = thread_current ();
-    
-    /* Update statistics. */
-    if (t == idle_thread)
+    struct thread *cur = thread_current ();
+
+    /* Update stats. */
+    if (cur == idle_thread)
         idle_ticks++;
 #ifdef USERPROG
-    else if (t->pagedir != NULL)
+    else if (cur->pagedir != NULL)
         user_ticks++;
 #endif
     else
         kernel_ticks++;
 
-    /* MLFQS/Aging Logic */
-    if (thread_mlfqs) {
-        mlfq_update();
+    // --- 스케줄러 로직: Aging 및 Time Slice 처리 ---
+    if (!thread_mlfqs) 
+    { 
+        /* 1. 에이징 로직: ready_list의 스레드 age 증가 및 우선순위 조정 */
+        enum intr_level old_level = intr_disable();
+        struct list_elem *e = list_begin(&ready_list);
+        
+        while (e != list_end(&ready_list))
+        {
+            struct thread *t = list_entry (e, struct thread, elem);
+            t->age++;
+            
+            if (t->age >= AGING_TICKS)
+            {
+                t->age = 0;
+                
+                // 우선순위 한 단계 상승 (최대 PRI_DEFAULT까지)
+                if (t->priority < PRI_DEFAULT) {
+                    t->priority++;
+                    
+                    // 우선순위가 바뀌었으므로 리스트에서 제거 후 재삽입 (정렬 유지)
+                    e = list_remove(&t->elem);
+                    list_insert_ordered (&ready_list, &t->elem, priority_less, NULL);
+                    
+                    // 우선순위가 높아졌다면 즉시 선점 고려
+                    if (t->priority > cur->priority) {
+                        intr_yield_on_return ();
+                    }
+                    
+                    continue; // 재삽입 후 다음 요소를 위해 continue
+                }
+            }
+            e = list_next(e);
+        }
+        intr_set_level(old_level);
+        
+        /* 2. 일반 우선순위 스케줄링의 시간 슬라이스는 선점형 로직으로 대체되었음 */
+        // 기존의 라운드 로빈 로직 제거 (TIME_SLICE 기반)
     }
-    else {
-        // Priority Scheduling 모드: 대기 스레드 에이징
-        aging_ready_threads(); 
-    }
-    
-    /* Enforce preemption. */
-    if (thread_mlfqs == false) {
-        if (++thread_ticks >= TIME_SLICE)
+    else /* MLFQS 모드 */
+    {
+        enum intr_level old_level = intr_disable();
+        
+        // --- 1. Aging/Promotion (대기 중인 모든 스레드) ---
+        // Q2 -> Q1 -> Q0 순서로 순회하며 승급
+        bool promoted_to_q0 = false; 
+
+        for (enum mlfqs_queue q = Q2; q >= Q0; q--) 
+        {
+            struct list *q_list = mlfqs_get_queue(q);
+            struct list_elem *e = list_begin(q_list);
+            
+            while (e != list_end(q_list))
+            {
+                struct thread *t = list_entry (e, struct thread, elem);
+                t->age++;
+
+                if (t->age >= AGING_TICKS)
+                {
+                    t->age = 0;
+                    if (t->mlfqs_queue_level > Q0) 
+                    {
+                        t->mlfqs_queue_level--; // 승급
+                        
+                        e = list_remove(&t->elem);
+                        list_push_back (mlfqs_get_queue(t->mlfqs_queue_level), &t->elem);
+                        
+                        if (t->mlfqs_queue_level == Q0)
+                            promoted_to_q0 = true;
+                        
+                        continue; // 삭제되었으므로 continue
+                    }
+                }
+                e = list_next(e);
+            }
+        }
+        
+        // Promotion에 의한 선점: Q0으로 승급되어 현재 실행 중인 스레드가 Q0이 아니라면 선점
+        if (promoted_to_q0 && cur->mlfqs_queue_level != Q0) {
             intr_yield_on_return ();
+        }
+
+        // --- 2. Demotion (현재 실행 중인 스레드) ---
+        if (cur != idle_thread) {
+            cur->mlfqs_ticks++;
+            
+            int current_slice = (cur->mlfqs_queue_level == Q0) ? MLFQS_Q0_SLICE : 
+                                (cur->mlfqs_queue_level == Q1) ? MLFQS_Q1_SLICE : 
+                                                                 MLFQS_Q2_SLICE;
+                                                                 
+            if (cur->mlfqs_ticks >= current_slice) 
+            {
+                cur->mlfqs_ticks = 0;
+                
+                if (cur->mlfqs_queue_level < Q2) // Q2가 아닐 때만 강등 가능
+                {
+                    cur->mlfqs_queue_level++; // 강등
+                }
+                
+                // 시간 슬라이스 소모 완료 또는 강등 후 yield (스케줄러 호출)
+                thread_yield (); 
+            }
+        }
+        intr_set_level(old_level);
     }
-    // MLFQS 모드의 타임 슬라이스 관리는 mlfq_update() 내에서 intr_yield_on_return()을 호출합니다.
+    // ===================================================================
+
+    /* Enforce preemption. (기존 라운드 로빈 로직) */
+    if (++thread_ticks >= TIME_SLICE && !thread_mlfqs)
+        intr_yield_on_return ();
 }
 
 /* Prints thread statistics. */
@@ -145,9 +301,14 @@ thread_print_stats (void)
 }
 
 /* Creates a new kernel thread named NAME with the given PRIORITY,
-   which executes FUNCTION passing AUX as the argument, and adds it to
-   the ready queue. Returns the thread identifier for the new thread, or
-   TID_ERROR if creation fails. */
+   which executes FUNCTION, passing AUX as the argument, and adds it
+   to the ready queue.  Returns the thread identifier for the new
+   thread, or TID_ERROR if creation fails.
+
+   If thread_start() has been called, then the new thread may be
+   scheduled before thread_create() returns.  It could even exit
+   before thread_create() returns.  Changes to *aux passed by the 
+   caller may be lost if the thread exits before the return. */
 tid_t
 thread_create (const char *name, int priority, thread_func *function, void *aux)
 {
@@ -156,7 +317,6 @@ thread_create (const char *name, int priority, thread_func *function, void *aux)
     struct switch_entry_frame *ef;
     struct switch_threads_frame *sf;
     tid_t tid;
-    enum intr_level old_level;
 
     ASSERT (function != NULL);
 
@@ -181,80 +341,72 @@ thread_create (const char *name, int priority, thread_func *function, void *aux)
 
     /* Stack frame for switch_threads(). */
     sf = alloc_frame (t, sizeof *sf);
-    sf->eip = (void (*) (void)) thread_schedule_tail;
-    sf->esi = sf->edi = sf->ebp = 0;
+    sf->eip = (void (*) (void)) switch_entry;
+    sf->edi = (uint32_t) t;
+    sf->esi = (uint32_t) t;
+    sf->ebp = (uint32_t) t;
 
     /* Add to run queue. */
-    old_level = intr_disable ();
     thread_unblock (t);
-
-    /* 선점 (새로운 스레드가 현재 스레드보다 우선순위가 높으면 yield) */
-    if (t->priority > thread_current()->priority)
-        thread_yield();
-
-    intr_set_level (old_level);
 
     return tid;
 }
 
-/* Puts the current thread to sleep. It will not be scheduled again until
-   awoken by thread_unblock(). */
+/* Puts the current thread to sleep.  It will not be scheduled
+   again until awoken by thread_unblock().
+
+   This function must be called with interrupts turned off.  It
+   is usually a better idea to use one of the synchronization
+   primitives in synch.h. */
 void
 thread_block (void)
 {
+    ASSERT (!intr_context ());
+    ASSERT (intr_get_level () == INTR_OFF);
     thread_current ()->status = THREAD_BLOCKED;
     schedule ();
 }
 
-/* Transitions a blocked thread T to the ready-to-run state. */
+/* Transitions a blocked thread T to the ready-to-run state.
+   This is an all-purpose wake-up function.
+
+   If thread_start() has been called, T is moved to the ready list.
+   If T's priority is higher than the current running thread, 
+   the current thread must be preempted. */
 void
 thread_unblock (struct thread *t)
 {
     enum intr_level old_level;
-    ASSERT (is_thread (t));
 
+    ASSERT (is_thread (t));
     old_level = intr_disable ();
     ASSERT (t->status == THREAD_BLOCKED);
+
+    // ===================================================================
+    // *** MODIFICATION: 큐 삽입 및 선점 로직 ***
+    if (thread_mlfqs) {
+        // MLFQS: 해당 큐의 맨 뒤에 삽입 (FIFO within queue)
+        list_push_back (mlfqs_get_queue(t->mlfqs_queue_level), &t->elem);
+        t->age = 0; // 큐에 진입 시 age 초기화
+        
+        // MLFQS Q0 즉시 선점: Q0에 새 스레드가 추가되었고 현재 스레드가 Q0이 아니면 선점
+        if (t->mlfqs_queue_level == Q0 && thread_current()->mlfqs_queue_level != Q0) {
+            intr_yield_on_return ();
+        }
+
+    } else {
+        // 우선순위 스케줄링: 우선순위 순으로 ready_list에 삽입
+        list_insert_ordered (&ready_list, &t->elem, priority_less, NULL);
+        t->age = 0; // 큐에 진입 시 age 초기화
+        
+        // 선점 체크: Unblock된 스레드의 우선순위가 현재 스레드보다 높으면 즉시 양보(yield)
+        if (t->priority > thread_current()->priority)
+            thread_yield ();
+    }
+    // ===================================================================
     
     t->status = THREAD_READY;
-    
-    if (thread_mlfqs == false) {
-        /* Priority Scheduling: 우선순위 순으로 삽입 */
-        list_insert_ordered (&ready_list, &t->elem, thread_cmp_priority, NULL);
-
-        /* 선점 (Unblock된 스레드가 현재 스레드보다 우선순위가 높으면 yield) */
-        if (t->priority > thread_current()->priority)
-            thread_yield(); // thread_yield는 intr_context()를 확인하므로 안전
-    }
-    else {  
-        /* MLFQS Scheduling: 큐에 push_back */
-        if (t->queue_level == -1) {
-            t->queue_level = 0;
-            t->age[0] = t->age[1] = t->age[2] = 0;
-        }
-        list_push_back(&mlfq[t->queue_level], &t->elem);
-        
-        // MLFQS 선점: unblock된 스레드가 더 높은 우선순위 큐(작은 인덱스)에 있을 때
-        if (t->queue_level < thread_current()->queue_level) {
-             intr_yield_on_return();
-        }
-    }
-
     intr_set_level (old_level);
-}
-
-/* Returns the current thread's thread id. */
-tid_t
-thread_tid (void)
-{
-    return thread_current ()->tid;
-}
-
-/* Returns the current thread. */
-struct thread *
-thread_current (void)
-{
-    return running_thread ();
 }
 
 /* Returns the name of the running thread. */
@@ -264,163 +416,15 @@ thread_name (void)
     return thread_current ()->name;
 }
 
-/* Deschedules the current thread and destroys it. */
-void
-thread_exit (void) 
-{
-    ASSERT (!intr_context ());
-
-#ifdef USERPROG
-    process_exit ();
-#endif
-
-    /* Remove thread from all threads list, set our status to dying,
-       and schedule another process.  That process will destroy us
-       when it calls thread_schedule_tail(). */
-    intr_disable ();
-    list_remove (&thread_current()->allelem);
-    thread_current ()->status = THREAD_DYING;
-    schedule ();
-    NOT_REACHED ();
-}
-
-/* Yields the CPU.  The current thread is not put to sleep and may be
-   scheduled again immediately at the scheduler's whim. */
-void
-thread_yield (void)
-{
-    struct thread *cur = thread_current ();
-    enum intr_level old_level;
-
-    ASSERT (!intr_context ());
-
-    old_level = intr_disable ();
-    if (cur != idle_thread) {
-        if (thread_mlfqs == false) {
-            /* Priority Scheduling: 우선순위 순으로 삽입 */
-            list_insert_ordered (&ready_list, &cur->elem, thread_cmp_priority, NULL);
-        } else {
-            /* MLFQS Scheduling: 현재 큐에 push_back */
-            if (cur->queue_level == -1)
-                cur->queue_level = 0;
-            list_push_back (&mlfq[cur->queue_level], &cur->elem);
-        }
-    }
-        
-    cur->status = THREAD_READY;
-    schedule ();
-    intr_set_level (old_level);
-}
-
-/* Performs some operation on thread t, given auxiliary data AUX. */
-void
-thread_foreach (thread_action_func *action, void *aux)
-{
-    struct list_elem *e;
-
-    intr_disable ();
-    for (e = list_begin (&all_list); e != list_end (&all_list); e = list_next (e))
-        {
-            struct thread *t = list_entry (e, struct thread, allelem);
-            action (t, aux);
-        }
-    intr_enable ();
-}
-
-/* Returns the current thread's priority. */
-int
-thread_get_priority (void)
-{
-    return thread_current ()->priority;
-}
-
-/* Sets the current thread's base priority to NEW_PRIORITY. 
-   If priority donation is active, the effective priority is recalculated. */
-void
-thread_set_priority (int new_priority) 
-{
-    enum intr_level old_level = intr_disable();
-    struct thread *cur = thread_current();
-    
-    if (thread_mlfqs == false) {
-        // 1. 원래 우선순위(original_priority)를 먼저 업데이트
-        cur->original_priority = new_priority;
-        
-        // 2. 새로운 유효 우선순위를 계산하고 cur->priority에 반영
-        thread_recalculate_priority(cur);
-
-        // 3. 선점 로직 (priority-change 테스트 통과를 위한 핵심)
-        // 새로운 우선순위가 ready_list의 최고 우선순위보다 낮아지면 yield (선점)
-        if (!list_empty(&ready_list) && cur->priority < thread_get_max_ready_priority())
-            thread_yield();
-    }
-    intr_set_level(old_level);
-}
-
-/* Sets the current thread's nice value to NEW_NICE. */
-int
-thread_get_nice (void)
-{
-    // MLFQS 구현에 따라 구현 필요
-    return 0;
-}
-
-/* Returns the current thread's recent_cpu value. */
-void
-thread_set_nice (int new_nice)
-{
-    // MLFQS 구현에 따라 구현 필요
-}
-
-/* Returns the current thread's recent_cpu value. */
-int
-thread_get_recent_cpu (void)
-{
-    // MLFQS 구현에 따라 구현 필요
-    return 0;
-}
-
-/* Returns the current load_avg. */
-int
-thread_get_load_avg (void)
-{
-    // MLFQS 구현에 따라 구현 필요
-    return 0;
-}
-
-/* Idle thread.  Executes when no other thread is ready to run. */
-static void
-idle (void *aux UNUSED) 
-{
-    for (;;) 
-        {
-            intr_disable ();
-            thread_block ();
-            intr_enable ();
-        }
-}
-
-/* C code for the kernel_thread. */
-static void
-kernel_thread (thread_func *function, void *aux) 
-{
-    ASSERT (function != NULL);
-
-    intr_enable ();       /* Enable interrupts in kernel_thread. */
-    function (aux);       /* Execute the thread function. */
-    thread_exit ();       /* If function() returns, call thread_exit(). */
-}
-
-/* Returns the running thread. */
+/* Returns the running thread.
+   This is equivalent to thread_current (), but prettier. */
 struct thread *
 running_thread (void)
 {
     uint32_t *esp;
 
-    /* Tidy up to allow us to express 'const struct thread *t' in C. */
     asm ("mov %%esp, %0" : "=g" (esp));
-
-    return (struct thread *) ((uint32_t) esp & 0xfffff000);
+    return pg_round_down (esp);
 }
 
 /* Returns true if T appears to point to a valid thread. */
@@ -441,40 +445,94 @@ init_thread (struct thread *t, const char *name, int priority)
     memset (t, 0, sizeof *t);
     t->status = THREAD_BLOCKED;
     strlcpy (t->name, name, sizeof t->name);
-    t->stack = (uint8_t *)t + PGSIZE;
+    t->stack = (uint8_t *) t + PGSIZE;
     t->priority = priority;
-    t->magic = THREAD_MAGIC;
 
-    /* 🚨 [추가] Donation/Sleep 필드 초기화 */
-    t->original_priority = priority;
-    t->wait_on_lock = NULL;
-    list_init (&t->holding_locks);
-    t->wake_up_tick = 0; // Timer Sleep용
-    
-    /* MLFQ / bookkeeping defaults */
-    t->queue_level = -1;
-    t->nice = 0;
-    t->recent_cpu = 0;
-    t->age[0] = t->age[1] = t->age[2] = 0;
-    
+    // ===================================================================
+    // *** MODIFICATION: 에이징/MLFQS 멤버 초기화 ***
+    t->age = 0; 
+    if (thread_mlfqs) {
+      t->mlfqs_queue_level = Q0; // MLFQS는 Q0에서 시작
+      t->mlfqs_ticks = 0;
+    }
+    // ===================================================================
+
+    t->magic = THREAD_MAGIC;
     list_push_back (&all_list, &t->allelem);
 }
 
-/* Allocates a frame for an interrupt or exception handler. */
-static void *
-alloc_frame (struct thread *t, size_t size) 
-{
-    /* Stack starts in the user's stack page and grows down. */
-    ASSERT (is_thread (t));
-    ASSERT (size % 4 == 0);
+/* Chooses and returns the next thread to be scheduled.  If no
+   threads are ready to run, returns the idle thread.
 
-    t->stack -= size;
-    return t->stack;
+   You can rely on this function to have a novel implementation in
+   every project. */
+static struct thread *
+next_thread_to_run (void)
+{
+    // ===================================================================
+    // *** MODIFICATION: MLFQS 또는 우선순위 스케줄링에 따라 선택 ***
+    if (thread_mlfqs) {
+        // Q0 > Q1 > Q2 순서로 비어 있지 않은 가장 높은 큐의 스레드를 선택 (FIFO within queue)
+        if (!list_empty(&ready_list_q0))
+            return list_entry (list_pop_front (&ready_list_q0), struct thread, elem);
+        if (!list_empty(&ready_list_q1))
+            return list_entry (list_pop_front (&ready_list_q1), struct thread, elem);
+        if (!list_empty(&ready_list_q2))
+            return list_entry (list_pop_front (&ready_list_q2), struct thread, elem);
+        
+        return idle_thread;
+    } else {
+        // 우선순위 스케줄링: ready_list에서 가장 앞쪽(최고 우선순위) 스레드를 꺼낸다.
+        if (!list_empty (&ready_list))
+            return list_entry (list_pop_front (&ready_list), struct thread, elem);
+        else
+            return idle_thread;
+    }
+    // ===================================================================
 }
 
-/* Chooses and transitions to the next thread to be scheduled. */
+/* Completes a thread switch by activating the new thread's page
+   tables, and, if the previous process was dying, destroying it.
+
+   The thread passed to this function cannot be the running thread. */
+void
+thread_schedule_tail (struct thread *prev)
+{
+    struct thread *cur = running_thread ();
+    
+    ASSERT (intr_get_level () == INTR_OFF);
+    /* Mark us as running. */
+    cur->status = THREAD_RUNNING;
+
+    /* Start new time slice. */
+    thread_ticks = 0;
+
+#ifdef USERPROG
+    /* Activate the new thread's page tables. */
+    process_activate ();
+#endif
+
+    /* If the thread switched from is dying, destroy its struct
+       thread.  This must happen late so that thread_exit() doesn't
+       pull out the rug under itself.  (We don't free
+       initial_thread because its memory was not obtained via
+       palloc().) */
+    if (prev != NULL && prev->status == THREAD_DYING && prev != initial_thread)
+        {
+            ASSERT (prev != cur);
+            palloc_free_page (prev);
+        }
+}
+
+/* Schedules a new process.  At entry, interrupts must be off and
+   the running process's state must have been changed from
+   running to some other state.  This function finds another
+   thread to run and switches to it.
+
+   It's not safe to call printf() until thread_schedule_tail()
+   has completed. */
 static void
-schedule (void) 
+schedule (void)
 {
     struct thread *cur = running_thread ();
     struct thread *next = next_thread_to_run ();
@@ -489,60 +547,9 @@ schedule (void)
     thread_schedule_tail (prev);
 }
 
-/* Returns the highest-priority thread to run, or the idle thread if none
-   are ready. */
-static struct thread *
-next_thread_to_run (void)
-{
-    if (thread_mlfqs == false) {
-        /* Priority Scheduling: ready_list의 가장 높은 우선순위 스레드를 pop */
-        if (list_empty (&ready_list))
-            return idle_thread;
-        else
-            return list_entry (list_pop_front (&ready_list), struct thread, elem);
-    }
-    else {  
-        /* MLFQS Scheduling: Q0 -> Q1 -> Q2 순으로 pop */
-        for (int i = 0; i < 3; i++) {
-            if (!list_empty (&mlfq[i])) {
-                return list_entry (list_pop_front (&mlfq[i]), struct thread, elem);
-            }
-        }
-        return idle_thread;
-    }
-}
-
-/* Completes a thread switch by activating the new page tables,
-   and, if necessary, destroying the previous thread. */
-void
-thread_schedule_tail (struct thread *prev) 
-{
-    struct thread *cur = running_thread ();
-    
-    ASSERT (intr_get_level () == INTR_ON);
-
-    /* Mark us as running. */
-    cur->status = THREAD_RUNNING;
-
-    /* Activate the new thread's page tables. */
-#ifdef USERPROG
-    process_activate ();
-#endif
-
-    /* If the thread we switched from is dying, destroy it.
-       This must happen after activating the new thread's page tables,
-       because the dying thread's page tables become useless as soon as
-       they are deactivated. */
-    if (prev != NULL && prev->status == THREAD_DYING) 
-        {
-            ASSERT (prev != cur);
-            palloc_free_page (prev);
-        }
-}
-
-/* Allocates a new thread ID (tid). */
+/* Returns a tid to use for a new thread. */
 static tid_t
-allocate_tid (void) 
+allocate_tid (void)
 {
     static tid_t next_tid = 1;
     tid_t tid;
@@ -553,203 +560,70 @@ allocate_tid (void)
 
     return tid;
 }
-
-/* Priority-based list comparison functions */
+/* Finish up during a switch. */
 
-/* thread_cmp_priority - 우선순위 비교 함수 (높은 우선순위가 앞으로) */
-bool
-thread_cmp_priority(const struct list_elem *a, const struct list_elem *b, void *aux UNUSED)
-{
-   struct thread *t_a = list_entry(a, struct thread, elem);
-   struct thread *t_b = list_entry(b, struct thread, elem);
-   return t_a->priority > t_b->priority;
-}
-
-/* thread_cmp_wake_up_tick - 깨어날 시간(wake_up_tick)을 기준으로 비교 (작은 값이 앞으로) */
-bool
-thread_cmp_wake_up_tick(const struct list_elem *a, const struct list_elem *b, void *aux UNUSED)
-{
-    struct thread *t_a = list_entry(a, struct thread, elem);
-    struct thread *t_b = list_entry(b, struct thread, elem);
-    return t_a->wake_up_tick < t_b->wake_up_tick;
-}
+/* ... (나머지 기존 함수: thread_get_tid, thread_current, thread_exit) ... */
 
 
-/* thread_get_max_ready_priority - ready_list의 최고 우선순위 반환 (선점 로직용) */
-int
-thread_get_max_ready_priority(void)
-{
-    if (list_empty(&ready_list))
-        return PRI_MIN - 1; 
-    
-    struct thread *t = list_entry(list_front(&ready_list), struct thread, elem);
-    return t->priority;
-}
-
-/* thread_recalculate_priority - 현재 보유한 락과 original_priority를 기준으로 유효 우선순위 재계산 */
+/* Yields the CPU.  The current thread is not put to sleep and
+   may be scheduled again immediately at the scheduler's whim. */
 void
-thread_recalculate_priority(struct thread *t)
+thread_yield (void)
 {
-    if (thread_mlfqs == true) return;
+    struct thread *cur = thread_current ();
+    enum intr_level old_level;
     
-    int new_effective_priority = t->original_priority;
-    
-    // 보유한 모든 락의 최대 기부 우선순위를 찾습니다.
-    if (!list_empty(&t->holding_locks)) {
-        struct list_elem *e;
-        int max_donated_priority = PRI_MIN;
-        
-        for (e = list_begin(&t->holding_locks); e != list_end(&t->holding_locks); e = list_next(e)) {
-            struct lock *l = list_entry(e, struct lock, elem);
-            if (l->max_priority > max_donated_priority) {
-                max_donated_priority = l->max_priority;
-            }
-        }
-        
-        // 최종 유효 우선순위 = max(original_priority, max_donated_priority)
-        if (max_donated_priority > new_effective_priority) {
-            new_effective_priority = max_donated_priority;
-        }
-    }
-    
-    // 우선순위가 변경된 경우에만 업데이트 및 리스트 위치 갱신
-    if (t->priority != new_effective_priority) {
-        t->priority = new_effective_priority;
-
-        // ready 상태였고 우선순위가 변경되었다면, ready_list에서 위치를 갱신
-        if (t->status == THREAD_READY) {
-            list_remove(&t->elem);
-            list_insert_ordered(&ready_list, &t->elem, thread_cmp_priority, NULL);
-        }
-    }
-}
-
-/* thread_donate_priority - t에게 priority를 기부하고, t가 대기하는 락의 holder에게 연쇄 기부 */
-void
-thread_donate_priority(struct thread *t, int priority)
-{
-    if (thread_mlfqs == true) return;
-    
-    if (t->priority < priority) {
-        t->priority = priority;
-        
-        // 연쇄 기부: t가 락을 기다리고 있다면, 락의 max_priority를 갱신하고 holder에게 기부
-        if (t->wait_on_lock != NULL) {
-            // 락의 max_priority를 갱신
-            if (t->wait_on_lock->max_priority < priority) {
-                t->wait_on_lock->max_priority = priority;
-            }
-            
-            // 락 보유자가 있다면 재귀적으로 기부
-            if (t->wait_on_lock->holder != NULL) {
-                 thread_donate_priority(t->wait_on_lock->holder, priority);
-            }
-        }
-        
-        // ready 상태라면 리스트에서 제거 후 재삽입하여 정렬 위치 갱신
-        if (t->status == THREAD_READY) {
-            list_remove(&t->elem);
-            list_insert_ordered (&ready_list, &t->elem, thread_cmp_priority, NULL);
-        }
-    }
-}
-
-/* thread_remove_lock - 락 해제 시 우선순위 회수 및 갱신 */
-void
-thread_remove_lock(struct lock *lock)
-{
-    struct thread *cur = thread_current();
-    enum intr_level old_level = intr_disable();
-
-    // 락 해제 후 현재 스레드의 유효 우선순위 재계산
-    thread_recalculate_priority(cur);
-    
-    // 우선순위가 낮아진 경우 선점 유도
-    if (cur->priority < thread_get_max_ready_priority() && !intr_context())
-        thread_yield();
-    
-    intr_set_level(old_level);
-}
-
-/* aging_ready_threads - Priority Aging (우선순위 스케줄링 모드에서만 사용) */
-void
-aging_ready_threads(void)
-{
-    if (thread_mlfqs == false) {
-        struct list_elem *e = list_begin (&ready_list);
-        while (e != list_end (&ready_list)) {
-            struct list_elem *next = list_next(e);
-            struct thread *t = list_entry (e, struct thread, elem);
-
-            t->age[0]++; // age[0]을 일반 age 카운터로 사용
-            
-            if (t->age[0] >= AGE_LIMIT) {
-                t->age[0] = 0;
-                // PRI_MAX까지 승급 허용 (priority-aging 테스트 통과를 위해)
-                if (t->priority < PRI_MAX) { 
-                    t->priority++;
-                    
-                    // 우선순위가 바뀌었으므로 리스트에서 제거 후 재삽입
-                    list_remove(&t->elem);
-                    list_insert_ordered (&ready_list, &t->elem, thread_cmp_priority, NULL);
-                    
-                    // 우선순위가 높아졌다면 즉시 선점 유도
-                    if (t->priority > thread_current()->priority)
-                        intr_yield_on_return(); 
-                }
-            }
-            e = next;
-        }
-    }
-}
-
-
-/* mlfq_update - MLFQS 강등 및 에이징 승급 */
-void
-mlfq_update(void)
-{
-    struct thread *cur = thread_current();
-
+    old_level = intr_disable ();
     if (cur != idle_thread) {
-        cur->recent_cpu++;
-        int slice_limit = (cur->queue_level == 0) ? TIME_SLICE_Q0
-                         : (cur->queue_level == 1) ? TIME_SLICE_Q1
-                         : TIME_SLICE_Q2;
-
-        /* 1. 타임 슬라이스 소모 시 강등 및 yield */
-        if (cur->recent_cpu >= slice_limit) {
-            if (cur->queue_level < 2)
-                cur->queue_level++;
-            cur->recent_cpu = 0;
-            
-            // 강등 후 선점
-            intr_yield_on_return (); 
-            return;
+        // ===================================================================
+        // *** MODIFICATION: 큐 삽입 로직 ***
+        if (thread_mlfqs) {
+            // MLFQS: 현재 큐(강등된 큐일 수 있음)의 맨 뒤에 삽입
+            list_push_back (mlfqs_get_queue(cur->mlfqs_queue_level), &cur->elem);
+            cur->age = 0; // Yield 시 age 초기화
+        } else {
+            // 우선순위 스케줄링: 우선순위 순으로 ready_list에 삽입
+            list_insert_ordered (&ready_list, &cur->elem, priority_less, NULL);
+            cur->age = 0; // Yield 시 age 초기화
         }
+        // ===================================================================
     }
-
-    /* 2. 대기 중인 스레드 에이징 및 승급 */
-    for (int i = 0; i < 3; i++) {
-        struct list_elem *e = list_begin (&mlfq[i]);
-        while (e != list_end (&mlfq[i])) {
-            struct list_elem *next = list_next (e);
-            struct thread *t = list_entry (e, struct thread, elem);
-            
-            t->age[i]++;
-
-            if (t->age[i] >= AGE_LIMIT && t->queue_level > 0) {
-                // 승급
-                list_remove (&t->elem);
-                t->queue_level--;
-                t->age[0] = t->age[1] = t->age[2] = 0;  // 모든 age 카운터 리셋
-                list_push_back (&mlfq[t->queue_level], &t->elem);
-
-                // 승급으로 Q0에 스레드가 추가되었고, 현재 스레드보다 우선순위가 높다면 선점
-                if (t->queue_level < cur->queue_level) {
-                    intr_yield_on_return();
-                }
-            }
-            e = next;
-        }
-    }
+    cur->status = THREAD_READY;
+    schedule ();
+    intr_set_level (old_level);
 }
+
+
+/* Sets the current thread's priority to NEW_PRIORITY. */
+void
+thread_set_priority (int new_priority)
+{
+    enum intr_level old_level;
+    old_level = intr_disable ();
+    
+    // ===================================================================
+    // *** MODIFICATION: 우선순위 변경 및 선점 로직 ***
+    // MLFQS 모드에서는 우선순위 설정이 스케줄러에 영향을 미치지 않도록 처리
+    if (!thread_mlfqs) {
+        thread_current ()->priority = new_priority;
+
+        // 우선순위가 낮아졌고, ready_list에 더 높은 우선순위 스레드가 있으면 즉시 선점
+        if (!list_empty (&ready_list)) {
+            struct thread *highest_ready = list_entry (list_front (&ready_list), struct thread, elem);
+            if (thread_current ()->priority < highest_ready->priority)
+                thread_yield (); 
+        }
+    }
+    // ===================================================================
+    
+    intr_set_level (old_level);
+}
+
+/* Returns the current thread's priority. */
+int
+thread_get_priority (void)
+{
+  return thread_current ()->priority;
+}
+
+/* ... (thread_get_nice, thread_set_nice, thread_get_recent_cpu, thread_get_load_avg, thread_foreach) ... */
