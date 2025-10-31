@@ -172,32 +172,50 @@ thread_yield (void)
 /* (중략) thread_foreach - 기존과 동일 */
 
 /* thread_set_priority - 우선순위 기부 및 선점 반영 */
+/* threads/thread.c */
+// (추가 함수) 스레드가 현재 보유한 락을 기준으로 유효 우선순위를 다시 계산하는 함수
 void
-thread_set_priority(int new_priority) 
+thread_recalculate_priority (struct thread *t)
+{
+    // 스레드의 '원래' 우선순위(original_priority)로 시작
+    int new_effective_priority = t->original_priority;
+
+    // 1. 보유한 모든 락을 순회하며 가장 높은 기부 우선순위를 찾음
+    if (!list_empty(&t->holding_locks)) {
+        struct list_elem *e;
+        for (e = list_begin(&t->holding_locks); e != list_end(&t->holding_locks); e = list_next(e))
+        {
+            struct lock *l = list_entry(e, struct lock, elem);
+            // 락이 기부한 max_priority가 현재 계산된 유효 우선순위보다 높으면 갱신
+            if (l->max_priority > new_effective_priority) {
+                new_effective_priority = l->max_priority;
+            }
+        }
+    }
+
+    // 2. 새로운 유효 우선순위를 설정
+    t->priority = new_effective_priority;
+}
+
+
+// (메인 함수) 사용자 요청에 의해 호출됨
+void
+thread_set_priority(int new_priority)
 {
     enum intr_level old_level = intr_disable();
     struct thread *cur = thread_current();
-    
+
     if (thread_mlfqs == false) {
+        // 1. 원래 우선순위(original_priority) 업데이트
         cur->original_priority = new_priority;
         
-        // 최종 우선순위는 (원래 우선순위) 또는 (락으로부터 기부받은 우선순위) 중 높은 값
-        int new_effective_priority = new_priority;
-        
-        if (!list_empty(&cur->holding_locks)) {
-            // 보유한 락 목록을 순회하며 가장 높은 max_priority를 찾음
-            struct list_elem *e = list_max(&cur->holding_locks, thread_cmp_lock_priority, NULL);
-            struct lock *l = list_entry(e, struct lock, elem);
-            if (l->max_priority > new_effective_priority)
-                new_effective_priority = l->max_priority;
-        }
+        // 2. 보유한 락을 기반으로 유효 우선순위 재계산
+        thread_recalculate_priority(cur);
 
-        if (cur->priority != new_effective_priority) {
-            cur->priority = new_effective_priority;
-            
-            // 우선순위가 낮아졌거나, ready_list의 최고 우선순위보다 낮아지면 yield (선점)
-            if (cur->priority < thread_get_max_ready_priority())
-                thread_yield();
+        // 3. 선점 로직 (중요): 새로운 우선순위가 ready_list의 최고 우선순위보다 낮으면 yield
+        // 'priority-change' 테스트 통과를 위해 필수
+        if (!list_empty(&ready_list) && cur->priority < thread_get_max_ready_priority()) {
+            thread_yield();
         }
     }
     intr_set_level(old_level);
