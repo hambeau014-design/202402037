@@ -1,3 +1,5 @@
+/* synch.h */
+
 #ifndef THREADS_SYNCH_H
 #define THREADS_SYNCH_H
 
@@ -22,6 +24,12 @@ struct lock
 {
     struct thread *holder;      /* Thread holding lock (for debugging). */
     struct semaphore semaphore; /* Binary semaphore controlling access. */
+    
+    // ===================================================================
+    // *** MODIFICATION: 우선순위 기부(Donation)를 위한 멤버 추가 ***
+    struct list waiters;        /* List of threads waiting for this lock (for donation). */
+    int max_priority;           /* Highest priority of threads waiting on this lock. */
+    // ===================================================================
 };
 
 void lock_init (struct lock *);
