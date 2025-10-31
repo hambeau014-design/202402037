@@ -306,4 +306,4 @@ thread_print_stats (void)
    thread, or TID_ERROR if creation fails.
 
    If thread_start() has been called, then the new thread may be
-   scheduled before thread_create()
+   scheduled before thread_create()*/
