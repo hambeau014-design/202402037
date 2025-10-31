@@ -1,10 +1,9 @@
-/* synch.h */
-
 #ifndef THREADS_SYNCH_H
 #define THREADS_SYNCH_H
 
 #include <list.h>
 #include <stdbool.h>
+#include "threads/thread.h" // struct thread * 사용을 위해 추가
 
 /* A counting semaphore. */
 struct semaphore
