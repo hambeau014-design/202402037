@@ -31,12 +31,16 @@ typedef int tid_t;
 // *** MODIFICATION: MLFQS 및 Aging 상수/Enum 정의 (기존 코드를 유지하며) ***
 
 // Simplified MLFQS 큐 레벨 정의
-enum mlfqs_queue 
+/*enum mlfqs_queue 
 { 
     Q0, // Highest Priority, Time Slice 2
     Q1, // Medium Priority, Time Slice 4
     Q2  // Lowest Priority, Time Slice 8
-};
+};*/
+enum mlfqs_queue { Q0, Q1, Q2 };
+int mlfqs_queue_level;
+int mlfqs_ticks;
+int age;
 
 // Simplified MLFQS 시간 슬라이스 상수 정의
 #define MLFQS_Q0_SLICE 2
