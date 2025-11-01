@@ -1,6 +1,8 @@
 #ifndef DEVICES_TIMER_H
 #define DEVICES_TIMER_H
 
+#define TIMER_FREQ 100
+
 #include <round.h>
 #include <stdint.h>
 
