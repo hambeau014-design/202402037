@@ -14,95 +14,90 @@ typedef int tid_t;
 #define PRI_DEFAULT 31
 #define PRI_MAX 63
 
-/* Simplified MLFQS queue levels. */
+/* MLFQS(단순 3단 큐) 레벨 (필요시 사용; threads 단계에서는 flag만 존재해도 무방) */
 enum mlfqs_queue { Q0 = 0, Q1 = 1, Q2 = 2 };
 
-/* States. */
 enum thread_status {
-  THREAD_RUNNING,
-  THREAD_READY,
-  THREAD_BLOCKED,
-  THREAD_DYING
+  THREAD_RUNNING,     /* Running thread. */
+  THREAD_READY,       /* Not running but ready to run. */
+  THREAD_BLOCKED,     /* Waiting for an event to trigger. */
+  THREAD_DYING        /* About to be destroyed. */
 };
 
+struct lock;                 /* fwd decl */
 typedef void thread_func (void *aux);
 typedef void thread_action_func (struct thread *t, void *aux);
 
-struct lock; /* fwd */
+/* Thread control block. (Project 1 호환) */
+struct thread
+  {
+    /* --- 기본 필드 (Pintos 표준) --- */
+    tid_t tid;                      /* Thread identifier. */
+    enum thread_status status;      /* Thread state. */
+    char name[16];                  /* Name (for debugging purposes). */
+    uint8_t *stack;                 /* Saved stack pointer. */
+    int priority;                   /* Effective priority. */
+    struct list_elem allelem;       /* List element for all threads list. */
 
-/* Thread control block. */
-struct thread {
-  /* Owned by thread.c. */
-  tid_t tid;
-  enum thread_status status;
-  char name[16];
-  uint8_t *stack;
+    /* --- 스케줄링: ready/sleep 대기열 링크 --- */
+    struct list_elem elem;          /* List element. */
 
-  /* Priority scheduling (effective). */
-  int priority;
-  /* Original (base) priority for donation. */
-  int original_priority;
+    /* --- 우선순위 도네이션 --- */
+    int original_priority;          /* Base priority before donation. */
+    struct list donations;          /* List of donors (struct thread via donation_elem). */
+    struct list_elem donation_elem; /* As an element in someone else’s donations list. */
+    struct lock *wait_on_lock;      /* Lock I am waiting on (donation target). */
 
-  /* Donation list and link in other's donation list. */
-  struct list donations;             /* of struct thread, via donation_elem */
-  struct list_elem donation_elem;    /* when I am inside someone’s donations */
-  struct lock *wait_on_lock;         /* lock I'm waiting on (donate target) */
+    /* --- FIFO RR 타이브레이커 & 에이징 --- */
+    int64_t ready_stamp;            /* FIFO for equal priority in ready queue. */
+    int age;                        /* Aging counter while READY. */
 
-  /* Ready/sleep/all list linkage. */
-  struct list_elem elem;
+    /* --- Sleep(타이머) --- */
+    int64_t wakeup_tick;            /* Tick to wake at. */
 
-  /* FIFO for equal-priority round-robin: increasing stamp when enqueued. */
-  int64_t ready_stamp;
+    /* --- 단순 MLFQS(선택 사용) --- */
+    enum mlfqs_queue qlevel;        /* Q0 -> Q1 -> Q2 */
+    int run_ticks_in_level;         /* Consumed ticks in current level */
 
-  /* Aging (in ready queues). */
-  int age;
+    /* Detects stack overflow. */
+    unsigned magic;                 /* Detects stack overflow. */
+  };
 
-  /* Sleep support. */
-  int64_t wakeup_tick;
-
-  /* Simplified MLFQS (enabled when thread_mlfqs == true). */
-  enum mlfqs_queue qlevel;   /* Q0→Q1→Q2 */
-  int run_ticks_in_level;    /* used time slice inside current level */
-
-#ifdef USERPROG
-  uint32_t *pagedir;
-#endif
-  unsigned magic;
-};
-
-/* Global flag (set by kernel cmdline -mlfqs). */
+/* 전역 플래그: -mlfqs 사용 여부 (threads 단계에서는 false가 기본) */
 extern bool thread_mlfqs;
 
-/* Public API */
+/* Thread subsystem. */
 void thread_init (void);
 void thread_start (void);
 void thread_tick (void);
 void thread_print_stats (void);
 
+/* Basic thread functions. */
 typedef void thread_func (void *aux);
 tid_t thread_create (const char *name, int priority, thread_func *, void *aux);
 
 void thread_block (void);
 void thread_unblock (struct thread *);
-void thread_yield (void);
 
 const char *thread_name (void);
 struct thread *thread_current (void);
 tid_t thread_tid (void);
 void thread_exit (void) NO_RETURN;
+void thread_yield (void);
 
+/* Iteration. */
 void thread_foreach (thread_action_func *, void *aux);
 
-/* Priority APIs */
-void thread_set_priority (int);
+/* Priority. */
+void thread_set_priority (int new_priority);
 int  thread_get_priority (void);
 
-/* Donation helpers */
+/* Donation helpers. */
 void thread_update_priority (struct thread *t);
 void thread_donate_priority (void);
 void thread_remove_donation (struct lock *lock);
 
-/* Sleep helper used by timer.c */
+/* Sleep helper (timer.c에서 사용). */
 void thread_sleep_until (int64_t wake_tick);
 
 #endif /* threads/thread.h */
