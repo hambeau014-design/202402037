@@ -156,12 +156,22 @@ void cond_wait (struct condition *cond, struct lock *lock) {
   lock_acquire (lock);
 }
 
-void cond_signal (struct condition *cond, struct lock *lock UNUSED) {
-  if (!list_empty (&cond->waiters)) {
+void
+cond_signal (struct condition *cond, struct lock *lock UNUSED)
+{
+  if (!list_empty (&cond->waiters))
+  {
     list_sort (&cond->waiters, cond_sema_priority_cmp, NULL);
-    struct semaphore_elem *se = list_entry (list_pop_front (&cond->waiters), struct semaphore_elem, elem);
+    struct semaphore_elem *se = list_entry (list_pop_front (&cond->waiters),
+                                            struct semaphore_elem, elem);
     sema_up (&se->semaphore);
   }
+
+  /* 🔥 condvar도 signal 후 선점 */
+  if (!intr_context ())
+    thread_yield ();
+  else
+    intr_yield_on_return ();
 }
 
 void cond_broadcast (struct condition *cond, struct lock *lock) {
