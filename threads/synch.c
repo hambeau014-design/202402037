@@ -27,6 +27,12 @@
    PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR
    MODIFICATIONS.
 */
+
+#include "threads/synch.h"
+#include <stdio.h>
+#include <string.h>
+#include "threads/interrupt.h"
+#include "threads/thread.h"
 static bool
 sema_thread_priority_cmp (const struct list_elem *a,
                           const struct list_elem *b,
@@ -36,12 +42,6 @@ sema_thread_priority_cmp (const struct list_elem *a,
     const struct thread *tb = list_entry (b, struct thread, elem);
     return ta->priority > tb->priority;
 }
-
-#include "threads/synch.h"
-#include <stdio.h>
-#include <string.h>
-#include "threads/interrupt.h"
-#include "threads/thread.h"
 
 /* semaphore initialization */
 void
