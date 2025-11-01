@@ -163,21 +163,26 @@ void thread_block (void) {
   schedule ();
 }
 
-void thread_unblock (struct thread *t) {
-  enum intr_level old = intr_disable ();
+void
+thread_unblock (struct thread *t)
+{
+  enum intr_level old_level = intr_disable ();
   ASSERT (is_thread (t));
   ASSERT (t->status == THREAD_BLOCKED);
 
   list_insert_ordered (&ready_list, &t->elem, cmp_ready, NULL);
   t->status = THREAD_READY;
 
-  /* 즉시 선점 */
-  if (t->priority > thread_current ()->priority) {
-    if (!intr_context ()) thread_yield ();
-    else intr_yield_on_return ();
+  /*깨운 스레드가 현재보다 높으면 즉시 양보 */
+  if (t != thread_current () && t->priority > thread_current ()->priority)
+  {
+    if (!intr_context ())
+      thread_yield ();
+    else
+      intr_yield_on_return ();
   }
 
-  intr_set_level (old);
+  intr_set_level (old_level);
 }
 
 /* Sleep API (timer_sleep에서 사용) */
@@ -193,18 +198,24 @@ void thread_sleep_until (int64_t wake_tick) {
 }
 
 /* Priority API */
-void thread_set_priority (int new_priority) {
-  enum intr_level old = intr_disable ();
+void
+thread_set_priority (int new_priority)
+{
+  enum intr_level old_level = intr_disable ();
   struct thread *cur = thread_current ();
   cur->original_priority = new_priority;
   thread_update_priority (cur);
 
-  if (!list_empty (&ready_list)) {
-    struct thread *top = list_entry (list_front (&ready_list), struct thread, elem);
+  /*ready list의 가장 높은 priority 스레드와 비교 */
+  if (!list_empty (&ready_list))
+  {
+    struct thread *top = list_entry (list_front (&ready_list),
+                                     struct thread, elem);
     if (top->priority > cur->priority)
       thread_yield ();
   }
-  intr_set_level (old);
+
+  intr_set_level (old_level);
 }
 
 int thread_get_priority (void) { return thread_current ()->priority; }
