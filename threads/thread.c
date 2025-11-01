@@ -35,6 +35,7 @@ static int64_t next_wakeup = INT64_MAX;
 static struct thread *idle_thread;
 static struct thread *initial_thread;
 static struct lock tid_lock;
+static struct kernel_thread_frame;
 
 /* Statistics. */
 static long long idle_ticks;
@@ -234,7 +235,7 @@ thread_sleep_until (int64_t wake_tick)
 
   cur->wakeup_tick = wake_tick;
   list_insert_ordered (&sleep_list, &cur->elem, cmp_wakeup, NULL);
-  if (wakeup_tick < next_wakeup) next_wakeup = wake_tick;
+  if (wake_tick < next_wakeup) next_wakeup = wake_tick;
 
   thread_block ();
   intr_set_level (old);
