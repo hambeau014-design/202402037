@@ -26,7 +26,6 @@ enum thread_status {
 
 struct lock;                 /* fwd decl */
 typedef void thread_func (void *aux);
-typedef void thread_action_func (struct thread *t, void *aux);
 
 /* Thread control block. (Project 1 호환) */
 struct thread
@@ -62,6 +61,7 @@ struct thread
     /* Detects stack overflow. */
     unsigned magic;                 /* Detects stack overflow. */
   };
+typedef void thread_action_func (struct thread *t, void *aux);
 
 /* 전역 플래그: -mlfqs 사용 여부 (threads 단계에서는 false가 기본) */
 extern bool thread_mlfqs;
