@@ -120,20 +120,21 @@ bool sema_try_down (struct semaphore *sema)
   return ok;
 }
 
-void sema_up (struct semaphore *sema)
+void
+sema_up (struct semaphore *sema)
 {
   enum intr_level old = intr_disable ();
   if (!list_empty (&sema->waiters)) {
     list_sort (&sema->waiters, sema_waiter_cmp, NULL);
-    struct thread *t = list_entry (list_pop_front (&sema->waiters), struct thread, elem);
+    struct thread *t = list_entry (list_pop_front (&sema->waiters),
+                                   struct thread, elem);
     thread_unblock (t);
   }
   sema->value++;
   intr_set_level (old);
 
-  /* wakeup could enable a higher-priority thread immediately */
-  if (!intr_context ()) thread_yield ();
-  else                  intr_yield_on_return ();
+  /* 즉시 선점 */
+  intr_yield_on_return ();
 }
 
 /* -------- Lock -------- */
