@@ -38,4 +38,5 @@ void debug_backtrace_all (void);
 #else
 #define ASSERT(CONDITION) ((void)0)
 #define NOT_REACHED() for (;;)
+#define barrier() asm volatile ("" : : : "memory")
 #endif /* lib/debug.h */
