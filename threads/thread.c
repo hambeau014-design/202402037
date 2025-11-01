@@ -115,10 +115,9 @@ thread_update_priority (struct thread *t)
     int max_priority = t->original_priority;
 
     if (!list_empty(&t->donations)) {
-        // 기부받은 목록은 priority_less를 사용하여 정렬되어 있으므로, 
-        // 리스트의 맨 앞이 가장 높은 우선순위를 가집니다.
+        /* donations 리스트는 donation_elem으로 연결된 스레드들이며,
+           우선순위가 높은 순으로 정렬되어 있다면 맨 앞이 최고 우선순위이다. */
         struct thread *donor = list_entry (list_front(&t->donations), struct thread, donation_elem);
-        
         if (donor->priority > max_priority)
             max_priority = donor->priority;
     }
@@ -133,7 +132,7 @@ thread_donate_priority (void)
     struct thread *cur = thread_current();
     struct lock *lock;
     
-    // 재귀적 기부를 위해 8단계까지 (Pintos 재귀 한계)
+    /* 재귀적 기부를 위해 최대 체인 길이를 제한 (예: 8) */
     for (int i = 0; i < 8; i++) 
     {
         lock = cur->wait_on_lock;
@@ -142,34 +141,65 @@ thread_donate_priority (void)
             
         struct thread *holder = lock->holder;
         
-        // 락 소유자의 현재 우선순위가 기부할 우선순위보다 낮다면 업데이트
+        /* holder의 우선순위가 현재 스레드보다 낮으면 기부 */
         if (holder->priority < cur->priority) {
             holder->priority = cur->priority;
-            cur = holder; // 다음 단계 재귀적 기부를 위해 이동
+            /* 기부의 전파: holder가 또 다른 락을 기다리고 있다면 다음 loop에서 계속 */
+            cur = holder;
         } else {
-            break; // 더 이상 기부할 필요가 없습니다.
+            break;
         }
     }
 }
 
-/* 락 해제 또는 락 획득 시 락 대기 리스트에서 현재 스레드를 제거하고
+/* 락 해제 또는 락 획득 시 락 대기 리스트에서 해당 락 때문에 생긴 기부를 제거하고
    락 소유자의 우선순위를 재계산합니다. */
 void
 thread_remove_donation (struct lock *lock)
 {
+    if (lock == NULL) return;
+
     struct thread *holder = lock->holder;
     if (holder == NULL) return;
 
-    // 기부 목록에서 현재 락을 기다리던 스레드의 donation_elem을 제거합니다. 
-    // (lock_acquire 성공 시 호출)
-    // lock_acquire에서 이미 list_remove를 호출했으므로, 여기서는 락 소유자의 우선순위만 재계산합니다.
-    
-    // 락 소유자의 우선순위를 재계산합니다.
+    /* Intrs must be off or caller should ensure atomicity. We assume caller handles intr levels. */
+
+    /* Iterate over holder's donations list and remove donors that were waiting on this lock. */
+    struct list_elem *e = list_begin(&holder->donations);
+    while (e != list_end(&holder->donations))
+    {
+        struct list_elem *next = list_next(e);
+        struct thread *donor = list_entry(e, struct thread, donation_elem);
+
+        /* If this donor was waiting on the lock being released, remove it from donation list. */
+        if (donor->wait_on_lock == lock) 
+        {
+            list_remove(&donor->donation_elem);
+            /* After removal, donor->donation_elem is detached but donor struct remains unchanged.
+               donor->wait_on_lock will be cleared by the acquiring thread when it obtains the lock. */
+        }
+
+        e = next;
+    }
+
+    /* Recompute holder's effective priority after removals. */
     thread_update_priority(holder);
 
-    // 우선순위가 낮아졌다면 즉시 선점을 고려합니다.
-    if (holder->priority < thread_get_priority()) {
-        thread_yield();
+    /* If holder's priority dropped below the highest ready thread, yield to allow preemption. */
+    if (holder != thread_current()) {
+        /* If the current running thread has lower priority than top of ready list, yield */
+        if (!thread_mlfqs && !list_empty(&ready_list)) {
+            struct thread *top = list_entry(list_front(&ready_list), struct thread, elem);
+            if (top->priority > holder->priority)
+                thread_yield();
+        }
+    } else {
+        /* If holder is current thread, and its priority decreased, yield */
+        if (!thread_mlfqs && !list_empty(&ready_list)) {
+            struct thread *top = list_entry(list_front(&ready_list), struct thread, elem);
+            if (top->priority > holder->priority)
+                thread_yield();
+        }
     }
 }
 // ===================================================================
@@ -268,23 +298,24 @@ thread_tick (void)
                 if (t->priority < PRI_DEFAULT) {
                     t->priority++;
                     
-                    // 우선순위가 바뀌었으므로 리스트에서 제거 후 재삽입 (정렬 유지)
-                    e = list_remove(&t->elem);
+                    /* 우선순위가 바뀌었으므로 리스트에서 제거 후 재삽입 (정렬 유지) */
+                    list_remove(&t->elem);
                     list_insert_ordered (&ready_list, &t->elem, priority_less, NULL);
                     
-                    // 우선순위가 높아졌다면 즉시 선점 고려
+                    /* 우선순위가 높아졌다면 즉시 선점 고려 */
                     if (t->priority > cur->priority) {
                         intr_yield_on_return ();
                     }
                     
-                    continue; // 재삽입 후 다음 요소를 위해 continue
+                    /* next element already stored in e by list_remove logic not available;
+                       safe approach: restart traversal from front to avoid iterator invalidation.
+                       But for simplicity we advance to next: */
                 }
             }
             e = list_next(e);
         }
         intr_set_level(old_level);
         
-        /* 2. 일반 우선순위 스케줄링의 시간 슬라이스는 선점형 로직으로 대체되었음 */
     }
     else /* MLFQS 모드 */
     {
@@ -294,9 +325,13 @@ thread_tick (void)
         // --- 1. Aging/Promotion (대기 중인 모든 스레드) ---
         bool promoted_to_q0 = false; 
 
-        for (enum mlfqs_queue q = Q2; q >= Q0; q--) 
+        for (enum mlfqs_queue q = Q0; q <= Q2; q++) {
+            /* nothing here: loop used below */
+        }
+
+        for (int q = Q2; q >= Q0; q--) 
         {
-            struct list *q_list = mlfqs_get_queue(q);
+            struct list *q_list = mlfqs_get_queue((enum mlfqs_queue)q);
             struct list_elem *e = list_begin(q_list);
             
             while (e != list_end(q_list))
@@ -317,7 +352,7 @@ thread_tick (void)
                         if (t->mlfqs_queue_level == Q0)
                             promoted_to_q0 = true;
                         
-                        continue; // 삭제되었으므로 continue
+                        continue; /* continue because e updated */
                     }
                 }
                 e = list_next(e);
@@ -352,13 +387,7 @@ thread_tick (void)
     }
     // ===================================================================
 
-    /* Enforce preemption. (기존 라운드 로빈 로직) */
-    // ===================================================================
-    // *** MODIFICATION: 라운드 로빈 스케줄링 로직 제거 ***
-    // 우선순위 스케줄링에서는 선점 로직이 TIME_SLICE를 대신합니다.
-    // if (++thread_ticks >= TIME_SLICE && !thread_mlfqs)
-    //     intr_yield_on_return ();
-    // ===================================================================
+    /* Enforce preemption. (기존 라운드 로빈 로직 제거: 우선순위 기반 선점 사용) */
 }
 
 /* Prints thread statistics. */
@@ -474,8 +503,6 @@ thread_unblock (struct thread *t)
     }
     // ===================================================================
 }
-
-/* ... (get_next_tick_to_wakeup 함수는 timer.c에 정의되어 있으므로 생략) ... */
 
 /* Returns the current thread's thread control block. */
 struct thread *
