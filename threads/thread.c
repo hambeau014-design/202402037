@@ -12,9 +12,9 @@
 #include "threads/synch.h"
 #include "threads/vaddr.h"
 #include "devices/timer.h"
-#define barrier() asm volatile ("" : : : "memory")
 #ifdef USERPROG
 #include "userprog/process.h"
+#define barrier() asm volatile ("" : : : "memory")
 #endif
 
 #define THREAD_MAGIC 0xcd6abf4b
@@ -242,6 +242,24 @@ thread_yield (void)
     }
   schedule ();
   intr_set_level (old);
+}
+
+/* Applies function FUNC to all threads, passing along AUX. */
+void
+thread_foreach (thread_action_func *func, void *aux)
+{
+  enum intr_level old_level;
+
+  ASSERT (func != NULL);
+
+  old_level = intr_disable ();
+  struct list_elem *e;
+  for (e = list_begin (&all_list); e != list_end (&all_list); e = list_next (e))
+    {
+      struct thread *t = list_entry (e, struct thread, allelem);
+      func (t, aux);
+    }
+  intr_set_level (old_level);
 }
 
 void
