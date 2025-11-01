@@ -73,7 +73,7 @@ sema_down (struct semaphore *sema)
             /* Insert current thread into sema waiters in priority order.
                Use the thread's standard elem (elem) because sema waiters
                contain thread list elements. */
-            list_insert_ordered (&sema->waiters, &cur->elem, priority_less, NULL);
+            list_insert_ordered (&sema->waiters, &cur->elem, compare_thread_priority, NULL);
             thread_block ();
         }
     intr_set_level (old_level);
@@ -127,6 +127,7 @@ sema_up (struct semaphore *sema)
         }
     sema->value++;
     intr_set_level (old_level);
+    thread_yield();
 }
 
 /* Self test for semaphores. ... */
@@ -165,7 +166,7 @@ lock_acquire (struct lock *lock)
 
         /* 2) 기부 정보: 현재(donor)를 holder->donations에 우선순위 정렬로 추가.
            donation_elem는 holder의 donations 리스트에서 사용됩니다. */
-        list_insert_ordered(&lock->holder->donations, &cur->donation_elem, priority_less, NULL);
+        list_insert_ordered (&lock->waiters, &cur->donation_elem, compare_thread_priority, NULL);
 
         /* 3) 기부 전파: 현재 스레드가 기다리는 락의 소유자에게 우선순위를 전파 */
         thread_donate_priority();
@@ -269,9 +270,10 @@ cond_wait (struct condition *cond, struct lock *lock)
     sema_init (&waiter.semaphore, 0);
     /* Insert the semaphore_elem into cond->waiters in priority order.
        We compare by the thread that will be waiting on that semaphore.
-       To find that thread, we will use the sema->waiters list's front when signaling.
+       To find that thread, we will use the sema->waiters list's front when signaling. 
        But it's simpler to insert by the priority of current thread via waiter.elem wrapper. */
-    list_insert_ordered (&cond->waiters, &waiter.elem, 
+      list_insert_ordered (&cond->waiters, &waiter.elem, compare_thread_priority, NULL);
+    //list_insert_ordered (&cond->waiters, &waiter.elem, 
         (list_less_func *) (bool (*)(const struct list_elem *, const struct list_elem *, void *)) priority_less, NULL);
 
     lock_release (lock);
