@@ -12,6 +12,7 @@
 #include "threads/synch.h"
 #include "threads/vaddr.h"
 #include "devices/timer.h"
+#define barrier() asm volatile ("" : : : "memory")
 #ifdef USERPROG
 #include "userprog/process.h"
 #endif
@@ -21,6 +22,15 @@
 
 /* Aging: ready 상태에서 age가 20이 되면 priority +1, age=0 */
 #define AGING_LIMIT  20
+
+/* Returns a pointer to the next stack frame for T,
+   moving T's stack pointer down by SIZE bytes. */
+static void *
+alloc_frame (struct thread *t, size_t size)
+{
+  t->stack -= size;
+  return t->stack;
+}
 
 struct kernel_thread_frame {
     void *eip;
@@ -66,6 +76,8 @@ static void init_thread (struct thread *, const char *name, int priority);
 static void schedule (void);
 void thread_schedule_tail (struct thread *prev);
 static tid_t allocate_tid (void);
+bool is_thread (struct thread *t);
+void thread_print_stats (void);
 
 /* ---------------- Comparators ---------------- */
 
@@ -499,4 +511,20 @@ idle (void *aux UNUSED)
       intr_set_level (old);
       thread_yield ();
     }
+}
+
+bool
+is_thread (struct thread *t)
+{
+  return (t != NULL && t->magic == THREAD_MAGIC);
+}
+
+/* Offset of `stack` member within `struct thread`. Used by switch.S. */
+uint32_t thread_stack_ofs = offsetof (struct thread, stack);
+
+void
+thread_print_stats (void)
+{
+  printf ("Thread: %lld idle ticks, %lld kernel ticks, %lld user ticks\n",
+          idle_ticks, kernel_ticks, user_ticks);
 }
