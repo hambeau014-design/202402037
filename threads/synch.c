@@ -40,7 +40,7 @@ sema_thread_priority_cmp (const struct list_elem *a,
 {
     const struct thread *ta = list_entry (a, struct thread, elem);
     const struct thread *tb = list_entry (b, struct thread, elem);
-    return ta->priority > tb->priority;
+    return ta->priority > tb->priority;   /* 내림차순 */
 }
 
 /* semaphore initialization */
@@ -104,7 +104,8 @@ sema_down (struct semaphore *sema)
         sema->value--;
     else 
     {
-        list_insert_ordered (&sema->waiters, &cur->elem, sema_thread_priority_cmp, NULL);
+        list_insert_ordered (&sema->waiters, &thread_current()->elem,
+                     sema_thread_priority_cmp, NULL);
         thread_block ();
     }
     intr_set_level (old_level);
@@ -139,13 +140,13 @@ sema_up (struct semaphore *sema)
     ASSERT (sema != NULL);
     old_level = intr_disable ();
 
-    /* --- 이 한 줄이 매우 중요 --- */
-    list_sort (&sema->waiters, sema_thread_priority_cmp, NULL);
-
     if (!list_empty (&sema->waiters))
     {
-        struct thread *t = list_entry (list_pop_front (&sema->waiters),
-                                       struct thread, elem);
+        /* 정렬 여부와 무관하게 최고 우선순위 대기자를 직접 찾아서 꺼냄 */
+        struct list_elem *e =
+            list_max (&sema->waiters, sema_thread_priority_cmp, NULL);
+        list_remove (e);
+        struct thread *t = list_entry (e, struct thread, elem);
         thread_unblock (t);
     }
 
