@@ -4,7 +4,6 @@
 #include <debug.h>
 #include <list.h>
 #include <stdint.h>
-#include <stdbool.h> // bool 타입 사용을 위해 추가
 
 /* Thread identifier type. */
 typedef int tid_t;
@@ -30,7 +29,6 @@ typedef void thread_func (void *aux);
 typedef void thread_action_func (struct thread *t, void *aux);
 
 struct lock; /* fwd */
-struct intr_frame; // thread_create에서 사용되는 인터럽트 프레임 구조체 전방 선언
 
 /* Thread control block. */
 struct thread {
@@ -53,9 +51,6 @@ struct thread {
   /* Ready/sleep/all list linkage. */
   struct list_elem elem;
 
-  /* All list linkage. */
-  struct list_elem allelem; // thread.c의 init_thread에서 사용됨 (추가)
-
   /* FIFO for equal-priority round-robin: increasing stamp when enqueued. */
   int64_t ready_stamp;
 
@@ -69,8 +64,9 @@ struct thread {
   enum mlfqs_queue qlevel;   /* Q0→Q1→Q2 */
   int run_ticks_in_level;    /* used time slice inside current level */
 
-  /* Used by thread_create, contains kernel stack frame and switch frame */
-  struct intr_frame tf; 
+#ifdef USERPROG
+  uint32_t *pagedir;
+#endif
   unsigned magic;
 };
 
@@ -83,7 +79,7 @@ void thread_start (void);
 void thread_tick (void);
 void thread_print_stats (void);
 
-// thread_func 재정의 제거
+typedef void thread_func (void *aux);
 tid_t thread_create (const char *name, int priority, thread_func *, void *aux);
 
 void thread_block (void);
@@ -108,8 +104,5 @@ void thread_remove_donation (struct lock *lock);
 
 /* Sleep helper used by timer.c */
 void thread_sleep_until (int64_t wake_tick);
-
-/* Helper for thread.c */
-bool is_thread (struct thread *t); // is_thread 함수를 위한 선언 추가
 
 #endif /* threads/thread.h */
