@@ -118,3 +118,9 @@ static void timer_interrupt (struct intr_frame *args UNUSED) {
   ticks++;
   thread_tick ();
 }
+
+void
+timer_print_stats (void)
+{
+  printf ("Timer: %lld ticks\n", ticks);
+}
