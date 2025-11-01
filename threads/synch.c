@@ -141,17 +141,20 @@ sema_up (struct semaphore *sema)
     ASSERT (sema != NULL);
     old_level = intr_disable ();
 
-    /* 이 줄이 반드시 필요함 */
+    /* --- 이 한 줄이 매우 중요 --- */
     list_sort (&sema->waiters, sema_thread_priority_cmp, NULL);
 
-    if (!list_empty (&sema->waiters)) {
+    if (!list_empty (&sema->waiters))
+    {
         struct thread *t = list_entry (list_pop_front (&sema->waiters),
                                        struct thread, elem);
         thread_unblock (t);
     }
+
     sema->value++;
     intr_set_level (old_level);
 
+    /* 선점 처리 */
     if (!intr_context())
         thread_yield();
     else
