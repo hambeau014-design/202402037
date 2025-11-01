@@ -22,6 +22,12 @@
 /* Aging: ready 상태에서 age가 20이 되면 priority +1, age=0 */
 #define AGING_LIMIT  20
 
+struct kernel_thread_frame {
+    void *eip;
+    thread_func *function;
+    void *aux;
+};
+
 /* Non-MLFQS ready queue (priority desc, FIFO among equals). */
 static struct list ready_list;
 /* All threads list. */
