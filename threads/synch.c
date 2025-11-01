@@ -184,18 +184,3 @@ cond_signal (struct condition *cond, struct lock *lock UNUSED)
     sema_up (&sema_elem->semaphore);
   }
 }
-
-
-void
-cond_broadcast (struct condition *cond, struct lock *lock)
-{
-    ASSERT (cond != NULL);
-    ASSERT (lock != NULL);
-    ASSERT (!intr_context ());
-    ASSERT (lock_held_by_current_thread (lock));
-
-    while (!list_empty (&cond->waiters)) {
-        struct semaphore_elem *sema_elem = list_entry(list_pop_front(&cond->waiters), struct semaphore_elem, elem);
-        sema_up (&sema_elem->semaphore);
-    }
-}
