@@ -290,30 +290,21 @@ static void enqueue_ready (struct thread *t) {
   }
 }
 
-void thread_unblock (struct thread *t)
+void
+thread_unblock (struct thread *t)
 {
-  enum intr_level old = intr_disable ();
+  enum intr_level old_level = intr_disable ();
   ASSERT (is_thread (t));
   ASSERT (t->status == THREAD_BLOCKED);
 
   enqueue_ready (t);
   t->status = THREAD_READY;
 
-  /* Immediate preemption if the awakened thread outranks current. */
-  if (!thread_mlfqs) {
-    if (t != thread_current () && t->priority > thread_current ()->priority) {
-      if (!intr_context ()) thread_yield ();
-      else                 intr_yield_on_return ();
-    }
-  } else {
-    /* In MLFQS, any Q0 arrival should preempt Q1/Q2 currently running. */
-    if (t->qlevel == Q0 && thread_current ()->qlevel != Q0) {
-      if (!intr_context ()) thread_yield ();
-      else                 intr_yield_on_return ();
-    }
-  }
+  /* 즉시 선점: 무조건 intr_yield_on_return() 사용 */
+  if (t != thread_current () && t->priority > thread_current ()->priority)
+    intr_yield_on_return ();
 
-  intr_set_level (old);
+  intr_set_level (old_level);
 }
 
 void thread_yield (void)
