@@ -27,6 +27,15 @@
    PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR
    MODIFICATIONS.
 */
+static bool
+sema_thread_priority_cmp (const struct list_elem *a,
+                          const struct list_elem *b,
+                          void *aux UNUSED)
+{
+    const struct thread *ta = list_entry (a, struct thread, elem);
+    const struct thread *tb = list_entry (b, struct thread, elem);
+    return ta->priority > tb->priority;
+}
 
 #include "threads/synch.h"
 #include <stdio.h>
@@ -44,17 +53,6 @@ sema_init (struct semaphore *sema, unsigned value)
 }
 
 /* --- helper compare funcs local to synch.c --- */
-
-/* compare threads via their elem (for sema waiters / ready list) */
-static bool
-sema_thread_priority_cmp (const struct list_elem *a,
-                          const struct list_elem *b,
-                          void *aux UNUSED)
-{
-    const struct thread *ta = list_entry (a, struct thread, elem);
-    const struct thread *tb = list_entry (b, struct thread, elem);
-    return ta->priority > tb->priority;
-}
 
 /* compare donation list entries (donation_elem) */
 static bool
